@@ -449,7 +449,7 @@ graph[:derived_node][]
 ```
 """
 struct ComputeGraph <: AbstractComputeGraph
-    inputs::Dict{Symbol, Input}
+    inputs::Dict{Symbol, Input{ComputeGraph}}
     outputs::Dict{Symbol, Computed}
     nesting::NestedSearchTree
     onchange::Observable{Set{Symbol}}
@@ -459,6 +459,21 @@ struct ComputeGraph <: AbstractComputeGraph
     observerfunctions::Vector{Observables.ObserverFunction}
     obs_to_update::Vector{Observable}
 end
+
+# `ComputeGraph` only creates `Input{ComputeGraph}` and `ComputeEdge{ComputeGraph}`.
+# Splitting on them keeps calls on `computed.parent::AbstractEdge` statically
+# dispatched; other `AbstractEdge` subtypes still take the dynamic path.
+@inline function with_edge(f::F, edge::AbstractEdge) where {F}
+    if edge isa ComputeEdge{ComputeGraph}
+        return f(edge)
+    elseif edge isa Input{ComputeGraph}
+        return f(edge)
+    else
+        return f(edge)
+    end
+end
+
+parent_graph(edge::AbstractEdge) = edge.graph::ComputeGraph
 
 # This is used for typed edge initialization
 is_node_value_valid(x) = true
@@ -514,8 +529,7 @@ end
 
 function get_observable!(c::Computed; use_deepcopy = true)
     if hasparent(c)
-        p = getparent(c)
-        return get_observable!(p.graph, c.name; use_deepcopy = use_deepcopy)
+        return get_observable!(parent_graph(c.parent), c.name; use_deepcopy = use_deepcopy)
     else
         error("Cannot get observable for Computed without parent")
     end
@@ -531,7 +545,7 @@ end
 
 function ComputeGraph()
     graph = ComputeGraph(
-        Dict{Symbol, Input}(), Dict{Symbol, Computed}(),
+        Dict{Symbol, Input{ComputeGraph}}(), Dict{Symbol, Computed}(),
         NestedSearchTree(),
         Observable(Set{Symbol}()), Set{Symbol}(),
         Dict{Symbol, Observable}(), Set{Symbol}(),
@@ -614,7 +628,7 @@ to the node is updated.
 function mark_resolved!(computed::Computed)
     if hasparent(computed)
         try
-            mark_resolved!(computed.parent)
+            with_edge(mark_resolved!, computed.parent)
         catch e
             rethrow(ResolveException(computed, e))
         end
@@ -635,7 +649,7 @@ mark_resolved!(edge::Input) = edge.dirty = false
 
 function mark_dirty!(computed::Computed)
     hasparent(computed) || return
-    mark_dirty!(computed, computed.parent.graph.obs_to_update)
+    mark_dirty!(computed, parent_graph(computed.parent).obs_to_update)
     return
 end
 function mark_dirty!(computed::Computed, obs_to_update)
@@ -645,11 +659,11 @@ function mark_dirty!(computed::Computed, obs_to_update)
     # changed even though the computation has not marked it.
     @lock GLOBAL_LOCK begin
         computed.dirty = true
-        locked_mark_dirty!(computed.parent, obs_to_update)
+        with_edge(edge -> locked_mark_dirty!(edge, obs_to_update), computed.parent)
     end
     return
 end
-mark_dirty!(x::AbstractEdge) = mark_dirty!(x, x.graph.obs_to_update)
+mark_dirty!(x::AbstractEdge) = mark_dirty!(x, parent_graph(x).obs_to_update)
 function mark_dirty!(x, obs_to_update)
     @lock GLOBAL_LOCK begin
         locked_mark_dirty!(x, obs_to_update)
@@ -660,10 +674,10 @@ end
 function locked_mark_dirty!(edge::ComputeEdge, obs_to_update::Vector{Observable})
     if edge.got_resolved[]
         # Assumes this is the same graph as edge.outputs (for parent -> child graph edges)
-        g = edge.graph
+        g = parent_graph(edge)
         for output in edge.outputs
             push!(g.onchange.val, output.name)
-            g.onchange in obs_to_update || push!(obs_to_update, g.onchange)
+            push_unique!(obs_to_update, g.onchange)
         end
 
         edge.got_resolved[] = false
@@ -675,10 +689,9 @@ function locked_mark_dirty!(edge::ComputeEdge, obs_to_update::Vector{Observable}
 end
 
 function locked_mark_dirty!(input::Input, obs_to_update::Vector{Observable})
-    push!(input.graph.onchange.val, input.name)
-    if !(input.graph.onchange in obs_to_update)
-        push!(obs_to_update, input.graph.onchange)
-    end
+    g = parent_graph(input)
+    push!(g.onchange.val, input.name)
+    push_unique!(obs_to_update, g.onchange)
 
     input.dirty = true
     for edge in input.dependents
@@ -687,9 +700,19 @@ function locked_mark_dirty!(input::Input, obs_to_update::Vector{Observable})
     return
 end
 
-update_observables!(comp::Computed) = update_observables!(comp.parent)
-update_observables!(edge::Input) = update_observables!(edge.graph)
-update_observables!(edge::ComputeEdge) = update_observables!(edge.graph)
+# Observables don't define `==`, so this is equivalent to `in` but doesn't need
+# to dispatch on the abstractly typed elements
+function push_unique!(obs_to_update::Vector{Observable}, obs::Observable)
+    for x in obs_to_update
+        x === obs && return
+    end
+    push!(obs_to_update, obs)
+    return
+end
+
+update_observables!(comp::Computed) = update_observables!(parent_graph(comp.parent))
+update_observables!(edge::Input) = update_observables!(parent_graph(edge))
+update_observables!(edge::ComputeEdge) = update_observables!(parent_graph(edge))
 update_observables!(graph::ComputeGraph) = update_observables!(graph.obs_to_update)
 function update_observables!(obs_to_update::Vector{Observable})
     foreach(notify, obs_to_update)
@@ -706,8 +729,9 @@ function Base.notify(node::Union{Computed, Input})
 end
 
 function Base.setindex!(computed::Computed, @nospecialize(value))
-    if computed.parent isa Input
-        return setindex!(computed.parent, value)
+    parent = computed.parent
+    if parent isa Input
+        return setindex!(parent, value)
     else
         @lock GLOBAL_LOCK begin
             computed.value[] = value
@@ -1090,45 +1114,52 @@ end
 
 # do we want this type stable?
 # This is how we could get a type stable callback body for resolve
+# Output names are part of the type for `TypedEdge`s created by `TypedEdge_no_call`
+output_names(edge::TypedEdge{IT, <:NamedTuple}) where {IT} = keys(edge.outputs)
+function output_names(edge::TypedEdge)
+    return ntuple(i -> edge.output_nodes[i].name, Val(length(edge.outputs)))
+end
+
 function locked_resolve!(edge::TypedEdge)
     if any(edge.inputs_dirty) # only call if inputs changed
         dirty = _get_named_change(edge.inputs, edge.inputs_dirty)
         vals = map(getindex, edge.outputs)
-        names = ntuple(Val(length(vals))) do i
-            edge.output_nodes[i].name
-        end
-        last = NamedTuple{names}(vals)
+        last = NamedTuple{output_names(edge)}(vals)
         result = edge.callback(map(getindex, edge.inputs), dirty, last)
         if result isa Tuple
             length(result) == length(edge.outputs) || throw_length_mismatch(edge, result)
             set_result!(edge, result)
         elseif isnothing(result)
-            if LOG_NOTHING_SPLAT || LOG_NOTHING_SKIP
-                if should_log(logging_id(edge))
-                    @warn(
-                        "Returning `nothing` in `map!` and `register_computation!` callbacks " *
-                            "has been deprecated in favor of returning `skip_update` to allow " *
-                            "outputs to update to `nothing`. Setting all outputs to `nothing` " *
-                            "should be done with a tuple. " * source_info_str(edge)
-                    )
-                end
-            else
-                Base.depwarn(
-                    "Returning `nothing` in `map!` and `register_computation!` callbacks " *
-                        "has been deprecated in favor of returning `skip_update` to allow " *
-                        "outputs to update to `nothing`.  Setting all outputs to `nothing` " *
-                        "should be done with a tuple. Use " *
-                        "`ComputePipeline.log_nothing_skip(true)` to find problematic methods.",
-                    :locked_resolve!
-                )
-            end
-
+            warn_nothing_return(edge)
             foreach(x -> x.dirty = false, edge.output_nodes)
         elseif result === skip_update
             foreach(x -> x.dirty = false, edge.output_nodes)
         else
             throw_invalid_result(result)
         end
+    end
+    return
+end
+
+@noinline function warn_nothing_return(edge::TypedEdge)
+    if LOG_NOTHING_SPLAT || LOG_NOTHING_SKIP
+        if should_log(logging_id(edge))
+            @warn(
+                "Returning `nothing` in `map!` and `register_computation!` callbacks " *
+                    "has been deprecated in favor of returning `skip_update` to allow " *
+                    "outputs to update to `nothing`. Setting all outputs to `nothing` " *
+                    "should be done with a tuple. " * source_info_str(edge)
+            )
+        end
+    else
+        Base.depwarn(
+            "Returning `nothing` in `map!` and `register_computation!` callbacks " *
+                "has been deprecated in favor of returning `skip_update` to allow " *
+                "outputs to update to `nothing`.  Setting all outputs to `nothing` " *
+                "should be done with a tuple. Use " *
+                "`ComputePipeline.log_nothing_skip(true)` to find problematic methods.",
+            :locked_resolve!
+        )
     end
     return
 end
@@ -1152,7 +1183,7 @@ end
 
 function locked_resolve!(computed::Computed)
     if hasparent(computed)
-        locked_resolve!(computed.parent)
+        with_edge(locked_resolve!, computed.parent)
     end
     return
 end
@@ -1170,6 +1201,15 @@ unresolved/dirty. The edge output gets the result as if `select` was called
 directly, but doesn't pay the cost of resolving unused inputs.
 """
 select(i::Int, choices...) = choices[i]
+
+@noinline function throw_select_out_of_bounds(edge::ComputeEdge, idx::Int)
+    throw(
+        SelectException(
+            "Selection index $(idx - 1) is out of bounds for indexing $(length(edge.inputs) - 1) inputs.",
+            edge
+        )
+    )
+end
 
 function locked_resolve!(edge::ComputeEdge)
     edge.got_resolved[] && return
@@ -1191,14 +1231,7 @@ function locked_resolve!(edge::ComputeEdge)
             N = 3
         end
 
-        if !(2 <= idx <= N)
-            throw(
-                SelectException(
-                    "Selection index $(idx - 1) is out of bounds for indexing $(length(edge.inputs) - 1) inputs.",
-                    edge
-                )
-            )
-        end
+        (2 <= idx <= N) || throw_select_out_of_bounds(edge, idx)
 
         locked_resolve!(edge.inputs[idx])
         edge.inputs_dirty[idx] = false
@@ -1243,7 +1276,7 @@ end
 function resolve!(computed::Computed)
     if hasparent(computed)
         try
-            resolve!(computed.parent)
+            with_edge(resolve!, computed.parent)
         catch e
             rethrow(ResolveException(computed, e))
         end
@@ -1867,6 +1900,8 @@ end
 struct MapFunctionWrapper{pack, FT} <: Function
     user_func::FT
     MapFunctionWrapper(f::FT, pack = true) where {FT} = new{pack, FT}(f)
+    # `FT` would bind to `DataType` for types used as callbacks (e.g. `map!(Vec3f, ...)`)
+    MapFunctionWrapper(f::Type{T}, pack = true) where {T} = new{pack, Type{T}}(f)
 end
 
 MapFunctionWrapper(::typeof(compute_identity), pack = true) = compute_identity
