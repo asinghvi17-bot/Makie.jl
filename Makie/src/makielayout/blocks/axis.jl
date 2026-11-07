@@ -626,7 +626,7 @@ function initialize_limit_computations!(ax)
     =#
 
     map!(attr, [:localxlimits, :xscale], :sharedxlimits) do _lims, xscale
-        lims = unwrap_explicit_update(_lims)
+        lims = unwrap_explicit_update(_lims)::Tuple{Float64, Float64}
         if !validate_limits_for_scale(lims, xscale)
             error("Invalid x-limits $lims for scale $(xscale) which is defined on the interval $(defined_interval(xscale))")
         end
@@ -647,7 +647,7 @@ function initialize_limit_computations!(ax)
     end
 
     map!(attr, [:localylimits, :yscale], :sharedylimits) do _lims, yscale
-        lims = unwrap_explicit_update(_lims)
+        lims = unwrap_explicit_update(_lims)::Tuple{Float64, Float64}
         if !validate_limits_for_scale(lims, yscale)
             error("Invalid y-limits $lims for scale $(yscale) which is defined on the interval $(defined_interval(yscale))")
         end
@@ -691,13 +691,15 @@ end
 
 function get_limits(ax::Axis, tf, itf)
     x0, x1, y0, y1 = (Inf, -Inf, Inf, -Inf)
+    # Plot types are open (user recipes), so `boundingbox(plot)` & co dispatch on the runtime plot type.
+    # The attributes read here and the bounding boxes are typed at the access to keep the loop concrete.
     for plot in ax.scene.plots
-        update_x = to_value(get(plot, :xautolimits, true))
-        update_y = to_value(get(plot, :yautolimits, true))
-        if is_data_space(plot) && to_value(get(plot, :visible, true)) && (update_x || update_y)
+        update_x = to_value(get(plot, :xautolimits, true))::Bool
+        update_y = to_value(get(plot, :yautolimits, true))::Bool
+        if is_data_space(plot) && to_value(get(plot, :visible, true))::Bool && (update_x || update_y)
             if (itf === nothing) || (itf === :nothing)
                 @warn "Axis transformation $tf does not define an `inverse_transform()`. This may result in a bad choice of limits due to model transformations being ignored." maxlog = 1
-                mini, maxi = extrema(Rect2d(data_limits(plot)))
+                mini, maxi = extrema(Rect2d(data_limits(plot))::Rect2d)
             else
                 # get limits with transform_func and model applied
                 bb = boundingbox(plot)
@@ -709,7 +711,7 @@ function get_limits(ax::Axis, tf, itf)
                     @warn "Failed to apply inverse transform $itf to bounding box $bb. Falling back on data_limits()." exception = e
                     bb = data_limits(plot)
                 end
-                mini, maxi = extrema(Rect2d(bb))
+                mini, maxi = extrema(Rect2d(bb)::Rect2d)
             end
 
             x0 = ifelse(update_x && isfinite(mini[1]), min(x0, mini[1]), x0)
@@ -723,8 +725,8 @@ end
 
 function autolimits(
         ax::Axis,
-        tf = ax.transform_func[], itf = inverse_transform(tf),
-        xmargin = ax.xautolimitmargin[], ymargin = ax.yautolimitmargin[]
+        tf = ax.transform_func[]::Tuple{Any, Any}, itf = inverse_transform(tf),
+        xmargin = ax.xautolimitmargin[]::Tuple{Float64, Float64}, ymargin = ax.yautolimitmargin[]::Tuple{Float64, Float64}
     )
     # try getting x limits for the axis and then union them with linked axes
     xlims, ylims = get_limits(ax, tf, itf)
@@ -744,29 +746,33 @@ function autolimits(
     return xlims, ylims
 end
 
-function calculate_local_limits(ax, (user_xlims, user_ylims), tf, itf, xmargins, ymargins)
+function calculate_local_limits(ax, limits, tf, itf, xmargins, ymargins)
+    user_xlims, user_ylims = limits::AxisLimits
     # Skip boundingbox calls (in autolimits -> getlimits) if user provides full limits
     if isnothing(user_xlims) || isnothing(user_ylims) || any(isnothing, user_xlims) || any(isnothing, user_ylims)
-        auto_xlims, auto_ylims = autolimits(ax, tf, itf, xmargins, ymargins)
+        auto_xlims, auto_ylims = autolimits(ax, tf, itf, xmargins, ymargins)::Tuple{Any, Any}
 
         xlims = if isnothing(user_xlims)
-            auto_xlims
+            auto_xlims::Tuple{Any, Any}
         else
-            something.(user_xlims, auto_xlims)
+            something.(user_xlims, auto_xlims::Tuple{Any, Any})
         end
 
         ylims = if isnothing(user_ylims)
-            auto_ylims
+            auto_ylims::Tuple{Any, Any}
         else
-            something.(user_ylims, auto_ylims)
+            something.(user_ylims, auto_ylims::Tuple{Any, Any})
         end
 
-        return Float64.(xlims), Float64.(ylims)
+        return float64_limits(xlims), float64_limits(ylims)
     else
-        return Float64.(user_xlims), Float64.(user_ylims)
+        return float64_limits(user_xlims), float64_limits(user_ylims)
     end
 
 end
+
+# The numeric type of user limits and of automatic limits (which depends on the scale) is open
+float64_limits(lims::Tuple{Any, Any}) = (Float64(lims[1])::Float64, Float64(lims[2])::Float64)
 
 function adjustlimits(limits, autolimitaspect, viewport, xautolimitmargin, yautolimitmargin)
     # in the simplest case, just update the final limits with the target limits
@@ -817,7 +823,7 @@ function update_xlims_locally!(ax, xlims, xreversed)
     # update xlims if they changed, keep ylims
     update!(
         ax,
-        limits = (xlims, ax.limits[][2]),
+        limits = (xlims, (ax.limits[]::AxisLimits)[2]),
         _limit_update_rule = (:force, :deny),
         xreversed = xreversed
     )
@@ -828,7 +834,7 @@ function update_ylims_locally!(ax, ylims, yreversed)
     # update ylims if they changed, keep xlims
     update!(
         ax,
-        limits = (ax.limits[][1], ylims),
+        limits = ((ax.limits[]::AxisLimits)[1], ylims),
         _limit_update_rule = (:deny, :force),
         yreversed = yreversed
     )
@@ -895,25 +901,25 @@ function reset_limits!(ax::Axis; xauto = true, yauto = true)
     # (x/y)auto = false means we keep whatever limits we currently have for
     # every nothing in limits
 
-    prev_sharedxlimits = ax.sharedxlimits[]
-    prev_sharedylimits = ax.sharedylimits[]
+    prev_sharedxlimits = ax.sharedxlimits[]::Tuple{Float64, Float64}
+    prev_sharedylimits = ax.sharedylimits[]::Tuple{Float64, Float64}
 
     ax.limits::Computed = ax.limits[]
 
     # recover previous limits for each *auto = false
     # Writes to local limits to re-trigger axis linking
     if !xauto
-        current_sharedxlimits = ax.sharedxlimits[]
+        current_sharedxlimits = ax.sharedxlimits[]::Tuple{Float64, Float64}
         ax.localxlimits[] = ifelse.(
-            isnothing.(ax.limits[][1]),
+            isnothing.((ax.limits[]::AxisLimits)[1]),
             prev_sharedxlimits, current_sharedxlimits
         )
     end
 
     if !yauto
-        current_sharedylimits = ax.sharedylimits[]
+        current_sharedylimits = ax.sharedylimits[]::Tuple{Float64, Float64}
         ax.localylimits[] = ifelse.(
-            isnothing.(ax.limits[][2]),
+            isnothing.((ax.limits[]::AxisLimits)[2]),
             prev_sharedylimits, current_sharedylimits
         )
     end
