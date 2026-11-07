@@ -1749,3 +1749,42 @@ end
     put!(gate, nothing)
     @test fetch(task) == 2
 end
+
+@testset "Result error messages" begin
+    function resolve_error(f)
+        try
+            f()
+        catch e
+            return e isa ResolveException ? e.error : e
+        end
+        return nothing
+    end
+
+    graph = ComputeGraph()
+    add_input!(graph, :x, 1)
+    register_computation!((inputs, changed, cached) -> (graph,), graph, [:x], [:invalid_type])
+    e = resolve_error(() -> graph.invalid_type[])
+    @test e isa ComputePipeline.InvalidResultTypesError
+    @test sprint(showerror, e) == "Edge callback returned invalid types for outputs: [invalid_type = ::ComputeGraph]"
+
+    register_computation!((inputs, changed, cached) -> 1, graph, [:x], [:not_a_tuple])
+    e = resolve_error(() -> graph.not_a_tuple[])
+    @test e isa ComputePipeline.InvalidResultError
+    @test startswith(sprint(showerror, e), "Wrong type as result Int64.")
+
+    register_computation!((inputs, changed, cached) -> (1, 2), graph, [:x], [:too_long])
+    e = resolve_error(() -> graph.too_long[])
+    @test e isa ComputePipeline.ResultLengthMismatchError
+    @test startswith(sprint(showerror, e), "Result needs to have same length. Found: (1, 2), for func ")
+
+    # same error from a later (typed) resolve
+    register_computation!(graph, [:x], [:later_too_long]) do inputs, changed, cached
+        return inputs.x < 3 ? (inputs.x,) : (1, 2)
+    end
+    graph.later_too_long[]
+    graph.x = 2
+    graph.later_too_long[]
+    graph.x = 5
+    e = resolve_error(() -> graph.later_too_long[])
+    @test e isa ComputePipeline.ResultLengthMismatchError
+end

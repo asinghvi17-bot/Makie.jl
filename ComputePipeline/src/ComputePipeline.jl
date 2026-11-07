@@ -315,41 +315,88 @@ function TypedEdge(callback, edge::ComputeEdge)
     return Base.invokelatest(TypedEdge, edge, callback, inputs)
 end
 
-Base.@nospecializeinfer @noinline function throw_invalid_result_types(edge::ComputeEdge, @nospecialize(result::Tuple))
-    invalid_results = [output.name => value for (output, value) in zip(edge.outputs, result) if !is_node_value_valid(value)]
-    strings = map(kv -> "$(kv[1]) = ::$(typeof(kv[2]))", invalid_results)
-    str = join(strings, ", ")
-    error("Edge callback returned invalid types for outputs: [$str]")
+# Error and warning messages are formatted when they are shown, not where they are
+# raised. Formatting them uses reflection (`which`, `methods`) and `show` on values
+# of unknown type, which would otherwise be part of the resolve path that ahead-of-time
+# compilation (e.g. `juliac --trim`) has to verify.
+
+struct InvalidResultTypesError <: Exception
+    edge::ComputeEdge
+    result::Tuple
 end
 
+function Base.showerror(io::IO, e::InvalidResultTypesError)
+    invalid_results = [output.name => value for (output, value) in zip(e.edge.outputs, e.result) if !is_node_value_valid(value)]
+    strings = map(kv -> "$(kv[1]) = ::$(typeof(kv[2]))", invalid_results)
+    str = join(strings, ", ")
+    return print(io, "Edge callback returned invalid types for outputs: [$str]")
+end
+
+struct ResultLengthMismatchError <: Exception
+    callback::Any
+    result::Tuple
+end
+
+function Base.showerror(io::IO, e::ResultLengthMismatchError)
+    m = first(methods(e.callback))
+    return print(io, "Result needs to have same length. Found: $(e.result), for func $(m.file):$(m.line)")
+end
+
+struct InvalidResultError <: Exception
+    result::Any
+end
+
+function Base.showerror(io::IO, e::InvalidResultError)
+    return print(io, "Wrong type as result $(typeof(e.result)). Needs to be Tuple with one element per output. Value: $(e.result)")
+end
+
+# A log message that appends the source location of an edge callback when printed.
+struct EdgeMessage
+    msg::String
+    edge::Any # ComputeEdge or TypedEdge, only used when printing
+end
+
+Base.show(io::IO, m::EdgeMessage) = print(io, m.msg, source_info_str(m.edge))
+
+# Thrown instead of `Base.depwarn`'s `ErrorException(msg)` with `--depwarn=error`,
+# which would need the formatted message as a `String`.
+struct EdgeMessageException <: Exception
+    message::EdgeMessage
+end
+
+Base.showerror(io::IO, e::EdgeMessageException) = show(io, e.message)
+
+Base.@nospecializeinfer @noinline function throw_invalid_result_types(edge::ComputeEdge, @nospecialize(result::Tuple))
+    throw(InvalidResultTypesError(edge, result))
+end
+
+# called with a `ComputeEdge` (first resolve) or a `TypedEdge`
 Base.@nospecializeinfer @noinline function throw_length_mismatch(edge::ComputeEdge, @nospecialize(result::Tuple))
-    m = first(methods(edge.callback))
-    line = string(m.file, ":", m.line)
-    error("Result needs to have same length. Found: $(result), for func $(line)")
+    throw(ResultLengthMismatchError(edge.callback, result))
+end
+Base.@nospecializeinfer @noinline function throw_length_mismatch(edge::TypedEdge, @nospecialize(result::Tuple))
+    throw(ResultLengthMismatchError(edge.callback, result))
 end
 
 Base.@nospecializeinfer @noinline function throw_invalid_result(@nospecialize(result::Any))
-    error("Wrong type as result $(typeof(result)). Needs to be Tuple with one element per output. Value: $result")
+    throw(InvalidResultError(result))
 end
 
 @noinline function warn_nothing_init(edge::ComputeEdge)
+    msg = EdgeMessage(
+        "Initializing multiple outputs with `return nothing` is deprecated. " *
+            "Use a tuple `(nothing, nothing, ...)` to initialize each individually. ",
+        edge
+    )
     if LOG_NOTHING_SPLAT
         if should_log(logging_id(edge))
-            @warn(
-                "Initializing multiple outputs with `return nothing` is deprecated. " *
-                    "Use a tuple `(nothing, nothing, ...)` to initialize each individually. " *
-                    source_info_str(edge)
-            )
+            @warn(msg)
         end
     else
         # This only triggers once, so it's not very useful for actually fixing
         # upstream map!/register_computation! methods
-        Base.depwarn(
-            "Initializing multiple outputs with `return nothing` is deprecated. " *
-                "Use a tuple `(nothing, nothing, ...)` to initialize each individually. " *
-                source_info_str(edge),
-            :warn_nothing_init
-        )
+        Base.JLOptions().depwarn == 2 && throw(EdgeMessageException(msg))
+        Base.depwarn(msg, :warn_nothing_init)
     end
     return
 end
@@ -380,23 +427,20 @@ function _init_outputs(result::Tuple, edge::ComputeEdge)
 end
 
 function _init_outputs(::Nothing, edge::ComputeEdge)
+    msg = EdgeMessage(
+        "Initializing multiple outputs with `return nothing` is deprecated. " *
+            "Use a tuple `(nothing, nothing, ...)` to initialize each individually. ",
+        edge
+    )
     if LOG_NOTHING_SPLAT
         if should_log(logging_id(edge))
-            @warn(
-                "Initializing multiple outputs with `return nothing` is deprecated. " *
-                    "Use a tuple `(nothing, nothing, ...)` to initialize each individually. " *
-                    source_info_str(edge)
-            )
+            @warn(msg)
         end
     else
         # This only triggers once, so it's not very useful for actually fixing
         # upstream map!/register_computation! methods
-        Base.depwarn(
-            "Initializing multiple outputs with `return nothing` is deprecated. " *
-                "Use a tuple `(nothing, nothing, ...)` to initialize each individually. " *
-                source_info_str(edge),
-            :TypedEdge
-        )
+        Base.JLOptions().depwarn == 2 && throw(EdgeMessageException(msg))
+        Base.depwarn(msg, :TypedEdge)
     end
 
     outputs = ntuple(length(edge.outputs)) do i
@@ -1137,11 +1181,12 @@ function set_result!(edge::TypedEdge, result, i, value)
     # equals the stored (dereferenced) value, so the output would stay perpetually dirty.
     new_val = deref(value)
     if LOG_NOTHING_SKIP && isnothing(new_val) && should_log(logging_id(edge))
-        @warn(
+        @warn EdgeMessage(
             "Found `map!` or `register_computation!` callback which returns " *
                 "nothing for one of its outputs. This might be incorrect since " *
                 "nothing has been replaced by `skip_update` for marking outputs " *
-                "as unchanged. " * source_info_str(edge)
+                "as unchanged. ",
+            edge
         )
     end
 
@@ -1161,7 +1206,7 @@ end
 
 function set_result!(edge::TypedEdge, result::Tuple)
     if length(result) != length(edge.outputs)
-        error("Did not return correct length: $(length(result)) $result results into $(length(edge.outputs)) outputs, in $(edge.callback)")
+        throw_length_mismatch(edge, result)
     end
     next_val = first(result)
     rem = Base.tail(result)
@@ -1176,11 +1221,12 @@ end
 function set_result!(edge::TypedEdge, ::Nothing)
     if LOG_NOTHING_SPLAT || LOG_NOTHING_SKIP
         if should_log(logging_id(edge))
-            @warn(
+            @warn EdgeMessage(
                 "Returning `nothing` in `map!` and `register_computation!` callbacks " *
                     "has been deprecated in favor of returning `skip_update` to allow " *
                     "outputs to update to `nothing`. Setting all outputs to `nothing` " *
-                    "should be done with a tuple. " * source_info_str(edge)
+                    "should be done with a tuple. ",
+                edge
             )
         end
     else
@@ -1197,8 +1243,8 @@ function set_result!(edge::TypedEdge, ::Nothing)
     return
 end
 
-function set_result!(::TypedEdge, ::T) where {T}
-    error("Needs to return a Tuple with one element per output or nothing, but returned $T")
+function set_result!(::TypedEdge, @nospecialize(result))
+    throw_invalid_result(result)
 end
 
 is_same(@nospecialize(old), @nospecialize(new)) = false
