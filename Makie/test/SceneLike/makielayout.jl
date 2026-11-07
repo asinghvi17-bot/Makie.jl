@@ -229,6 +229,31 @@ end
     @test_throws MethodError limits!(f[1, 1], -1, 1, -1, 1)
 end
 
+@testset "autolimits defaults and reset_limits! with xauto/yauto = false" begin
+    f = Figure()
+    ax = Axis(f[1, 1])
+    pl = lines!(ax, Point2f.(1:10, 1:10))
+    reset_limits!(ax)
+    # the default arguments of `autolimits(ax)` match what the limit pipeline passes
+    tf = ax.transform_func[]
+    @test Makie.autolimits(ax) ==
+        Makie.autolimits(ax, tf, Makie.inverse_transform(tf), ax.xautolimitmargin[], ax.yautolimitmargin[])
+    before = ax.finallimits[]
+    pl[1] = Point2f.(2 .* (1:10), 3 .* (1:10))
+    # xauto = false keeps the previous x limits and recomputes y
+    reset_limits!(ax; xauto = false)
+    @test ax.finallimits[].origin[1] ≈ before.origin[1]
+    @test ax.finallimits[].widths[1] ≈ before.widths[1]
+    @test ax.finallimits[].widths[2] > before.widths[2]
+    # yauto = false keeps the previous y limits and recomputes x
+    ylims_before = (ax.finallimits[].origin[2], ax.finallimits[].widths[2])
+    pl[1] = Point2f.(4 .* (1:10), 5 .* (1:10))
+    reset_limits!(ax; yauto = false)
+    @test ax.finallimits[].origin[2] ≈ ylims_before[1]
+    @test ax.finallimits[].widths[2] ≈ ylims_before[2]
+    @test ax.finallimits[].widths[1] > before.widths[1]
+end
+
 # issue 3240
 @testset "Axis limits 4-tuple" begin
     fig = Figure()

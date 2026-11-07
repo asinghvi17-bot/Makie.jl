@@ -695,7 +695,7 @@ function get_limits(ax::Axis, tf, itf)
         if is_data_space(plot) && to_value(get(plot, :visible, true)) && (update_x || update_y)
             if (itf === nothing) || (itf === :nothing)
                 @warn "Axis transformation $tf does not define an `inverse_transform()`. This may result in a bad choice of limits due to model transformations being ignored." maxlog = 1
-                mini, maxi = extrema(Rect2d(data_limits(ax)))
+                mini, maxi = extrema(Rect2d(data_limits(plot)))
             else
                 # get limits with transform_func and model applied
                 bb = boundingbox(plot)
@@ -705,7 +705,7 @@ function get_limits(ax::Axis, tf, itf)
                     bb = apply_transform(itf, bb)
                 catch e
                     @warn "Failed to apply inverse transform $itf to bounding box $bb. Falling back on data_limits()." exception = e
-                    bb = data_limits(ax.scene, exclude)
+                    bb = data_limits(plot)
                 end
                 mini, maxi = extrema(Rect2d(bb))
             end
@@ -721,8 +721,8 @@ end
 
 function autolimits(
         ax::Axis,
-        tf = ax.scene.transform_func, itf = inverse_transform(tf),
-        xmargin = ax.xautolimitmargin, ymargin = ax.yautolimitmargin
+        tf = ax.transform_func[], itf = inverse_transform(tf),
+        xmargin = ax.xautolimitmargin[], ymargin = ax.yautolimitmargin[]
     )
     # try getting x limits for the axis and then union them with linked axes
     xlims, ylims = get_limits(ax, tf, itf)
@@ -902,16 +902,16 @@ function reset_limits!(ax::Axis; xauto = true, yauto = true)
     # Writes to local limits to re-trigger axis linking
     if !xauto
         current_sharedxlimits = ax.sharedxlimits[]
-        ax.localxlimits[]::Computed = ifelse.(
-            isnothing.(unwrap_explicit_update(ax.xlimits[])),
+        ax.localxlimits[] = ifelse.(
+            isnothing.(ax.limits[][1]),
             prev_sharedxlimits, current_sharedxlimits
         )
     end
 
     if !yauto
         current_sharedylimits = ax.sharedylimits[]
-        ax.localylimits[]::Computed = ifelse.(
-            isnothing.(unwrap_explicit_update(ax.ylimits[])),
+        ax.localylimits[] = ifelse.(
+            isnothing.(ax.limits[][2]),
             prev_sharedylimits, current_sharedylimits
         )
     end
