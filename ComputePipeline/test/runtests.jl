@@ -19,4 +19,8 @@ using ComputePipeline.Observables
         include("modification.jl")
         include("system_tests.jl")
     end
+
+    @testset "StaticDispatch" failfast = false begin
+        include("static_dispatch.jl")
+    end
 end
