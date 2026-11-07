@@ -910,23 +910,25 @@ function reset_limits!(ax::Axis; xauto = true, yauto = true)
     # Writes to local limits to re-trigger axis linking
     if !xauto
         current_sharedxlimits = ax.sharedxlimits[]::Tuple{Float64, Float64}
-        ax.localxlimits[] = ifelse.(
-            isnothing.((ax.limits[]::AxisLimits)[1]),
-            prev_sharedxlimits, current_sharedxlimits
-        )
+        user_xlimits = (ax.limits[]::AxisLimits)[1]
+        ax.localxlimits[] = keep_previous_limits(user_xlimits, prev_sharedxlimits, current_sharedxlimits)
     end
 
     if !yauto
         current_sharedylimits = ax.sharedylimits[]::Tuple{Float64, Float64}
-        ax.localylimits[] = ifelse.(
-            isnothing.((ax.limits[]::AxisLimits)[2]),
-            prev_sharedylimits, current_sharedylimits
-        )
+        user_ylimits = (ax.limits[]::AxisLimits)[2]
+        ax.localylimits[] = keep_previous_limits(user_ylimits, prev_sharedylimits, current_sharedylimits)
     end
 
     return
 end
 
+
+# For each `nothing` in the user limits keep the previous limit, otherwise take the current one
+keep_previous_limits(::Nothing, prev, current) = prev
+function keep_previous_limits(user::Tuple{Any, Any}, prev, current)
+    return (user[1] === nothing ? prev[1] : current[1], user[2] === nothing ? prev[2] : current[2])
+end
 
 ################################################################################
 

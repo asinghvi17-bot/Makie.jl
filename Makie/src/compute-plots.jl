@@ -26,8 +26,12 @@ end
 ComputePipeline.add_input!(f, p::Plot, args...; kwargs...) = add_input!(f, p.attributes, args...; kwargs...)
 ComputePipeline.add_input!(p::Plot, args...; kwargs...) = add_input!(p.attributes, args...; kwargs...)
 
-Base.haskey(x::Plot, key) = haskey(x.attributes, key)
-Base.get(f::Function, x::Plot, key::Symbol) = haskey(x.attributes, key) ? x.attributes[key] : f()
+# getfield: `x` is often an abstract `Plot` (e.g. from `scene.plots`), where `x.attributes` would dispatch dynamically
+Base.haskey(x::Plot, key) = haskey(getfield(x, :attributes), key)
+function Base.get(f::Function, x::Plot, key::Symbol)
+    attr = getfield(x, :attributes)
+    return haskey(attr, key) ? attr[key] : f()
+end
 Base.get(x::Plot, key::Symbol, default) = get(() -> default, x, key)
 
 Base.getindex(plot::Plot, key::Symbol) = getproperty(plot, key)
