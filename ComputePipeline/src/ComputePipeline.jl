@@ -507,6 +507,20 @@ struct ComputeGraph <: AbstractComputeGraph
     obs_to_update::Vector{Observable}
 end
 
+#=
+## Hooks for ahead-of-time compilation
+
+The functions marked "Hook" below are the points where the update/resolve path
+has to call into code whose types are only known at runtime (edge callbacks,
+input conversion functions, Any-typed node values). Each hook has a single
+method on a wide signature implementing the normal dynamic behaviour, and each
+call site passes narrower (usually concrete) argument types. Adding a method on
+exactly the call site's argument types therefore turns the call into a static
+call of the new method without overwriting anything. `ComputePipeline.StaticDispatch`
+does this for a set of built graphs to make the update/resolve path trim-safe
+(e.g. for `juliac --trim` or WasmCodegen). Without it, nothing changes.
+=#
+
 # `ComputeGraph` only creates `Input{ComputeGraph}` and `ComputeEdge{ComputeGraph}`.
 # Splitting on them keeps calls on `computed.parent::AbstractEdge` statically
 # dispatched; other `AbstractEdge` subtypes still take the dynamic path.
@@ -516,9 +530,12 @@ end
     elseif edge isa Input{ComputeGraph}
         return f(edge)
     else
-        return f(edge)
+        return other_edge(f, edge)
     end
 end
+
+# Hook: called with `(::F, ::AbstractEdge)`
+other_edge(f, @nospecialize(edge)) = f(edge)
 
 parent_graph(edge::AbstractEdge) = edge.graph::ComputeGraph
 
@@ -599,52 +616,71 @@ function ComputeGraph()
         Observables.ObserverFunction[], Observable[]
     )
 
-    on(graph.onchange) do changeset
-        # Remove node names not backed by observables
-        intersect!(changeset, keys(graph.observables))
-
-        obs_to_notify = graph.obs_to_notify
-
-        # update values without triggering observables and add all updated names
-        # to obs_to_notify
-        for key in changeset
-            # Still necessary?
-            haskey(graph.observables, key) || continue
-
-            val = graph.outputs[key][]
-            obs = graph.observables[key]
-            # Trust the graph to discard equal values. This doesn't work for
-            # anything updated in-place
-            if !(key in graph.should_deepcopy)
-                obs.val = val
-                push!(obs_to_notify, key)
-            elseif !isequal(val, obs[]) # treat in-place updates (use isequal to handle NaN correctly)
-                obs.val = deepcopy(val)
-                push!(obs_to_notify, key)
-            else # same value (with deepcopy), skip update
-                # delete!(changeset, key)
-            end
-        end
-
-        # Clear the changeset now so that if notify causes the graph to update
-        # again, the already processed names are not processed again.
-        empty!(changeset)
-
-        # trigger observables from obs_to_notify.
-        # Separating this from changeset allows notify to cause another
-        # on(onchange) to trigger without issues.
-        # - value setting & empty!(changeset) doesn't delete from obs_to_notify
-        # - the inner on(onchange) adds to the obs_to_notify Set, so no notifies
-        #   don't duplicate
-        while !isempty(obs_to_notify)
-            key = pop!(obs_to_notify)
-            notify(graph.observables[key])
-        end
-
-        return Consume(false)
-    end
+    on(GraphObservablesUpdater(graph), graph.onchange)
 
     return graph
+end
+
+# Listener of `graph.onchange` which updates `graph.observables`
+struct GraphObservablesUpdater
+    graph::ComputeGraph
+end
+
+function (updater::GraphObservablesUpdater)(changeset::Set{Symbol})
+    graph = updater.graph
+    # Remove node names not backed by observables
+    intersect!(changeset, keys(graph.observables))
+
+    obs_to_notify = graph.obs_to_notify
+
+    # update values without triggering observables and add all updated names
+    # to obs_to_notify
+    for key in changeset
+        # Still necessary?
+        haskey(graph.observables, key) || continue
+
+        obs = graph.observables[key]
+        # Trust the graph to discard equal values. This doesn't work for
+        # anything updated in-place
+        if sync_observable!(obs, graph.outputs[key], key in graph.should_deepcopy)
+            push!(obs_to_notify, key)
+        end
+    end
+
+    # Clear the changeset now so that if notify causes the graph to update
+    # again, the already processed names are not processed again.
+    empty!(changeset)
+
+    # trigger observables from obs_to_notify.
+    # Separating this from changeset allows notify to cause another
+    # on(onchange) to trigger without issues.
+    # - value setting & empty!(changeset) doesn't delete from obs_to_notify
+    # - the inner on(onchange) adds to the obs_to_notify Set, so no notifies
+    #   don't duplicate
+    while !isempty(obs_to_notify)
+        key = pop!(obs_to_notify)
+        notify(graph.observables[key])
+    end
+
+    return Consume(false)
+end
+
+# Hook: called with `(::Observable, ::Computed, ::Bool)`. Resolves `node` and
+# copies its value to `obs` without notifying. Returns whether `obs` changed.
+function sync_observable!(@nospecialize(obs), node::Computed, use_deepcopy::Bool)
+    return sync_observable_value!(obs, node[], use_deepcopy)
+end
+
+function sync_observable_value!(obs::Observable, val, use_deepcopy::Bool)
+    if !use_deepcopy
+        obs.val = val
+        return true
+    elseif !isequal(val, obs[]) # treat in-place updates (use isequal to handle NaN correctly)
+        obs.val = deepcopy(val)
+        return true
+    else # same value (with deepcopy), skip update
+        return false
+    end
 end
 
 """
@@ -792,9 +828,12 @@ end
 # Inputs are strictly 1:1 edges (from input.value -> output), so we don't need
 # to worry about avoiding changes to input.value between multiple dependents.
 # However we do technically still need to protect it while the callback runs.
+# Hook: called with `(::Input{ComputeGraph}, ::Any)`
+is_same_input_value(input::Input, @nospecialize(value)) = is_same(input.value, value)
+
 Base.setindex!(input::Input, @nospecialize(value)) = _setindex!(input, value, input.force_update)
 function _setindex!(input::Input, @nospecialize(value), force_update = false)
-    if !force_update && is_same(input.value, value)
+    if !force_update && is_same_input_value(input, value)
         return value
     end
     @lock GLOBAL_LOCK begin
@@ -808,7 +847,7 @@ end
 function _setproperty!(attr::ComputeGraph, key::Symbol, @nospecialize(value))
     input = attr.inputs[key]
     # Skip if the value is the same as before
-    if !input.force_update && is_same(input.value, value)
+    if !input.force_update && is_same_input_value(input, value)
         return value
     end
     @lock GLOBAL_LOCK begin
@@ -1119,7 +1158,7 @@ function set_result!(edge::TypedEdge, result, i, value)
         )
     end
 
-    if (new_val === skip_update) || is_same(edge.outputs[i][], new_val)
+    if (new_val === skip_update) || is_same_cached(edge.outputs[i], new_val)
         edge.output_nodes[i].dirty = false
     else
         edge.output_nodes[i].dirty = true
@@ -1138,6 +1177,9 @@ function set_result!(edge::TypedEdge, result)
     rem = Base.tail(result)
     return set_result!(edge, rem, 1, next_val)
 end
+
+# Hook: called with `(::RefValue{T}, ::S)`. Only dynamic if `T` is abstract.
+is_same_cached(ref::RefValue, new) = is_same(ref[], new)
 
 is_same(@nospecialize(old), @nospecialize(new)) = false
 is_same(old::Symbol, new::Symbol) = old == new
@@ -1170,21 +1212,28 @@ end
 
 function locked_resolve!(edge::TypedEdge)
     if any(edge.inputs_dirty) # only call if inputs changed
-        dirty = _get_named_change(edge.inputs, edge.inputs_dirty)
         vals = map(getindex, edge.outputs)
         last = NamedTuple{output_names(edge)}(vals)
-        result = edge.callback(map(getindex, edge.inputs), dirty, last)
-        if result isa Tuple
-            length(result) == length(edge.outputs) || throw_length_mismatch(edge, result)
-            set_result!(edge, result)
-        elseif isnothing(result)
-            warn_nothing_return(edge)
-            foreach(x -> x.dirty = false, edge.output_nodes)
-        elseif result === skip_update
-            foreach(x -> x.dirty = false, edge.output_nodes)
-        else
-            throw_invalid_result(result)
-        end
+        resolve_with_values!(edge, map(getindex, edge.inputs), last)
+    end
+    return
+end
+
+# Runs the callback of a dirty `TypedEdge` given the current input values and
+# the previous output values (`last`) and applies the result.
+function resolve_with_values!(edge::TypedEdge, inputs::NamedTuple, last::NamedTuple)
+    dirty = _get_named_change(edge.inputs, edge.inputs_dirty)
+    result = edge.callback(inputs, dirty, last)
+    if result isa Tuple
+        length(result) == length(edge.outputs) || throw_length_mismatch(edge, result)
+        set_result!(edge, result)
+    elseif isnothing(result)
+        warn_nothing_return(edge)
+        foreach(x -> x.dirty = false, edge.output_nodes)
+    elseif result === skip_update
+        foreach(x -> x.dirty = false, edge.output_nodes)
+    else
+        throw_invalid_result(result)
     end
     return
 end
@@ -1215,18 +1264,25 @@ end
 
 function locked_resolve!(input::Input)
     input.dirty || return
-    value = input.f(input.value)
-    if isdefined(input.output, :value)
-        input.output.value[] = deref(value)
-    else
-        input.output.value = value isa RefValue ? value : RefValue(value)
-    end
+    update_input_output!(input)
     input.dirty = false
     input.output.dirty = true
     for edge in input.dependents
         mark_input_dirty!(input, edge)
     end
     input.output.dirty = false
+    return
+end
+
+# Hook: called with `::Input{ComputeGraph}`. Applies `input.f` to the input
+# value and writes the result to the output node.
+function update_input_output!(input::Input)
+    value = input.f(input.value)
+    if isdefined(input.output, :value)
+        input.output.value[] = deref(value)
+    else
+        input.output.value = value isa RefValue ? value : RefValue(value)
+    end
     return
 end
 
@@ -1260,6 +1316,20 @@ select(i::Int, choices...) = choices[i]
     )
 end
 
+# Hook: called with `(::Computed, ::RefValue)`. Forwards the value selected by a
+# `select` or `ifelse` edge to its output.
+function forward_selected!(output::Computed, @nospecialize(choice))
+    new_value = choice[]
+    if is_initialized(output)
+        output.dirty = !is_same(output.value[], new_value)
+        output.value[] = new_value
+    else
+        output.dirty = true
+        output.value = RefValue(new_value)
+    end
+    return
+end
+
 function locked_resolve!(edge::ComputeEdge)
     edge.got_resolved[] && return
 
@@ -1284,32 +1354,13 @@ function locked_resolve!(edge::ComputeEdge)
 
         locked_resolve!(edge.inputs[idx])
         edge.inputs_dirty[idx] = false
-        new_value = edge.inputs[idx].value[]
-
-        output = edge.outputs[1]
-        if is_initialized(output)
-            output.dirty = !is_same(output.value[], new_value)
-            output.value[] = new_value
-        else
-            output.dirty = true
-            output.value = RefValue(new_value)
-        end
+        forward_selected!(edge.outputs[1], edge.inputs[idx].value)
     else
         foreach(locked_resolve!, edge.inputs)
-        if !isassigned(edge.typed_edge)
-            if edge.resolved_once[]
-                # First re-resolve: build the typed island from the values the
-                # dynamic first resolve produced (without calling back), then
-                # resolve it normally so the callback sees correct changed
-                # flags and cached values (incl. `skip_update` semantics).
-                edge.typed_edge[] = TypedEdge_no_call(edge)
-                locked_resolve!(edge.typed_edge[])
-            else
-                dynamic_resolve!(edge)
-                edge.resolved_once[] = true
-            end
+        if isassigned(edge.typed_edge)
+            resolve_typed_edge!(edge.typed_edge[])
         else
-            locked_resolve!(edge.typed_edge[])
+            resolve_untyped_edge!(edge)
         end
         fill!(edge.inputs_dirty, false)
     end
@@ -1322,16 +1373,38 @@ function locked_resolve!(edge::ComputeEdge)
     return
 end
 
+# Hook: called with `::TypedEdge`
+resolve_typed_edge!(@nospecialize(edge)) = locked_resolve!(edge)
+
+# Hook: called with `::ComputeEdge{ComputeGraph}` if the edge has no `TypedEdge` yet
+function resolve_untyped_edge!(edge::ComputeEdge)
+    if edge.resolved_once[]
+        # First re-resolve: build the typed island from the values the
+        # dynamic first resolve produced (without calling back), then
+        # resolve it normally so the callback sees correct changed
+        # flags and cached values (incl. `skip_update` semantics).
+        edge.typed_edge[] = TypedEdge_no_call(edge)
+        resolve_typed_edge!(edge.typed_edge[])
+    else
+        dynamic_resolve!(edge)
+        edge.resolved_once[] = true
+    end
+    return
+end
+
 function resolve!(computed::Computed)
     if hasparent(computed)
         try
             with_edge(resolve!, computed.parent)
         catch e
-            rethrow(ResolveException(computed, e))
+            rethrow(resolve_exception(computed, e))
         end
     end
     return computed.value[]
 end
+
+# Hook: called with `(::Computed, ::Any)`
+resolve_exception(@nospecialize(computed), @nospecialize(e)) = ResolveException(computed, e)
 
 # Resolve once without specializing the typed update path for a static plot.
 # Dispatching on the callback lets a callback bring its own first resolve.
@@ -1641,26 +1714,31 @@ The Observable listener is set up with `priority = typemax(Int)-1` and
 `Consume(false)`. This means it will take precedence over all but `typemax(Int)`
 priority and not block later updates.
 """
+# Observable listener which forwards updates to the input `key` of `graph`
+struct ObservableInputUpdater
+    graph::ComputeGraph
+    key::Symbol
+end
+
+function (updater::ObservableInputUpdater)(@nospecialize(new_val))
+    setproperty!(updater.graph, updater.key, new_val)
+    return Consume(false)
+end
+
 function add_input!(attr::ComputeGraph, k::Symbol, obs::Observable)
     add_input!(attr, k, obs[])
     # typemax-1 so it doesn't get disturbed by other listeners but can still be
     # blocked by a typemax obs
     # Setting it to lower priority, axis and colorbar don't get the latest update
     # Still need to investigate why exactly
-    of = on(obs; priority = typemax(Int) - 1) do new_val
-        setproperty!(attr, k, new_val)
-        return Consume(false)
-    end
+    of = on(ObservableInputUpdater(attr, k), obs; priority = typemax(Int) - 1)
     push!(attr.observerfunctions, of)
     return attr
 end
 
 function add_input!(f, attr::ComputeGraph, k::Symbol, obs::Observable)
     add_input!(f, attr, k, obs[])
-    of = on(obs, priority = typemax(Int) - 1) do new_val
-        setproperty!(attr, k, new_val)
-        return Consume(false)
-    end
+    of = on(ObservableInputUpdater(attr, k), obs, priority = typemax(Int) - 1)
     push!(attr.observerfunctions, of)
     return attr
 end
@@ -2464,6 +2542,7 @@ end
 include("io.jl")
 include("observables_compat.jl")
 include("utils.jl")
+include("StaticDispatch.jl")
 
 export Computed, ComputeEdge
 export ComputeGraph
