@@ -712,7 +712,7 @@ Axis(fig_or_scene; palette = nothing, kwargs...)
             You can choose the amount of space manually or pick the current automatic one with `tight_ticklabel_spacing!`.
 
         """
-        autolimitaspect = nothing
+        autolimitaspect::Union{Nothing, Float64} = nothing
         """
         Can be used to manually specify which axis limits are desired.
 

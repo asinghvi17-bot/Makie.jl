@@ -536,7 +536,7 @@ function add_attributes!(::Type{<:Axis}, graph, flattened_defaults)
     attr = documented_attributes(Axis)
     _, default = get_typed_default(attr, flattened_defaults, :limits)
     add_input!(convert_limit_attribute, graph, :limits, default)
-    ComputePipeline.set_type!(graph.limits, Any)
+    ComputePipeline.set_type!(graph.limits, AxisLimits)
     return
 end
 
@@ -564,14 +564,16 @@ function initialize_limit_computations!(ax)
         ax.scene.transformation.transform_func[] = transform_func
         return transform_func
     end
-    ComputePipeline.set_type!(attr.transform_func, Any)
+    # Scales are user-extensible (any callable with `inverse_transform`/`defined_interval`), so only the
+    # shape is fixed here: one scale per dimension.
+    ComputePipeline.set_type!(attr.transform_func, Tuple{Any, Any})
 
     map!(attr, :transform_func, :inverse_transform_func) do tf
         itf = inverse_transform(tf)
         # nothing is uses to discard updates so we need something else here
         return isnothing(itf) ? :nothing : itf
     end
-    ComputePipeline.set_type!(attr.inverse_transform_func, Any)
+    ComputePipeline.set_type!(attr.inverse_transform_func, Union{Symbol, Tuple{Any, Any}})
 
 
     # (x/y)lims!() need to be able to set limits across one dimension without
@@ -949,6 +951,15 @@ function mirror_ticks(tickpositions, ticksize, tickalign, viewport, side, axispo
     end
     return points
 end
+
+"""
+    AxisLimits
+
+Type of the converted `Axis` `limits` attribute (see `convert_limit_attribute`): per dimension either
+`nothing` or a `(low, high)` tuple whose entries are `nothing` or a user-provided limit value. The value
+type itself is left open (any `Real`, e.g. `Int`, `Float32`, `Rational`).
+"""
+const AxisLimits = Tuple{Union{Nothing, Tuple{Any, Any}}, Union{Nothing, Tuple{Any, Any}}}
 
 # this is so users can do limits = (left, right, bottom, top)
 function convert_limit_attribute(lims::Tuple{Any, Any, Any, Any})
