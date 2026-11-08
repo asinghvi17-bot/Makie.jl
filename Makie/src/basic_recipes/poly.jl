@@ -164,6 +164,9 @@ function to_lines(polygon, strokewidth)
 end
 
 to_lines(polygon) = (convert_arguments(Lines, polygon)[1], [typemax(Int)])
+# `Lines` has no conversion of its own for these, which would go through the recursive fallback of
+# `convert_arguments(::Type{<:AbstractPlot}, args...)` whose result type is not inferred
+to_lines(polygon::Union{Polygon, MultiPolygon}) = (convert_arguments(PointBased(), polygon)[1], [typemax(Int)])
 # Need to explicitly overload for Mesh, since otherwise, Mesh will dispatch to AbstractVector
 to_lines(polygon::GeometryBasics.Mesh) = (convert_arguments(PointBased(), polygon)[1], [typemax(Int)])
 

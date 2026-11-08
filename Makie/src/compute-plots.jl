@@ -430,8 +430,14 @@ function _register_input_arguments!(attr::ComputeGraph, input_args::Tuple)
     return inputs
 end
 
-function _register_expand_arguments!(::Type{P}, attr, inputs, input_args, is_merged = false) where {P}
-    # is_merged = true means that multiple arguments are collected in one input, i.e.:
+# (`is_merged` is a `Val` so that the callback below knows which of the two it is: a runtime `Bool` makes `args` a
+# `Union` of the tuple of arguments and its first element, whose splatting in `expand_dimensions(PTrait, args...)`
+# cannot be resolved, e.g. when the argument is a `GeometryBasics.Mesh`, which iterates over its faces)
+merged_arguments(::Val{true}, input_args) = input_args[1]
+merged_arguments(::Val{false}, input_args) = input_args
+
+function _register_expand_arguments!(::Type{P}, attr, inputs, input_args, is_merged::Val = Val(false)) where {P}
+    # is_merged = Val(true) means that multiple arguments are collected in one input, i.e.:
     #   true:   one input where attr[input][] = (arg1, arg2, ...)
     #   false:  multiple inputs where map(k -> attr[k][], inputs) = [arg1, arg2, ...]
     # this is used in text
@@ -440,7 +446,7 @@ function _register_expand_arguments!(::Type{P}, attr, inputs, input_args, is_mer
     expanded = something(expand_dimensions(PTrait, input_args...), input_args)
     # call it args for backwards compatibility (plot.args)
     map!(attr, inputs, :args) do input_args...
-        args = values(is_merged ? input_args[1] : input_args)
+        args = values(merged_arguments(is_merged, input_args))
         args_exp = expand_dimensions(PTrait, args...)
         return something(args_exp, args)
     end
@@ -567,9 +573,7 @@ function add_dim_converts!(::Type{P}, attr::ComputeGraph, dim_converts, args, ar
                     # return an array for VecTypes dimension
                     # These arrays are repackaged as a Point array which hopefully
                     # goes through the remaining conversions without issues
-                    parts = map(eachindex(dims[i]), dims[i]) do idx, dim
-                        return convert_dim_value(converts[dim], attr, expanded[i], last_vals[i], idx)
-                    end
+                    parts = convert_dim_value_parts(converts, attr, expanded[i], last_vals[i], dims[i])
                     return Point.(parts...)
                 end
             else
@@ -580,6 +584,17 @@ function add_dim_converts!(::Type{P}, attr::ComputeGraph, dim_converts, args, ar
     end
 
     return
+end
+
+# The dim converted components of a `VecTypes` argument, one per dimension in `dims`. For a `Tuple` of
+# dimensions they are a `Tuple` as well, which `Point.(parts...)` can splat without knowing its length at run time.
+function convert_dim_value_parts(converts, attr, value, last_value, dims::Tuple)
+    return ntuple(idx -> convert_dim_value(converts[dims[idx]], attr, value, last_value, idx), Val(length(dims)))
+end
+function convert_dim_value_parts(converts, attr, value, last_value, dims)
+    return map(eachindex(dims), dims) do idx, dim
+        return convert_dim_value(converts[dim], attr, value, last_value, idx)
+    end
 end
 
 function error_check_convert_arguments(P, args, user_kw, args_converted)

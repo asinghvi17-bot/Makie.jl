@@ -551,3 +551,58 @@ end
         @test nan_equal(convert_arguments(Lines, r)[1], ps)
     end
 end
+
+@testset "Mesh conversions have concrete types" begin
+    # (so that they can be compiled ahead of time; see `juliac --trim`)
+    MeshArgs(T) = Tuple{Type{Makie.Mesh}, T}
+    inferred(T) = Base.return_types(Makie.convert_arguments, MeshArgs(T))
+    is_concrete(T) = length(inferred(T)) == 1 && isconcretetype(only(inferred(T)))
+
+    # a mesh without normals gets them if it is 3D, one that has them is kept
+    # (meshes with `FaceView`s, such as `normal_mesh`, still convert through GeometryBasics.mesh)
+    m2 = GeometryBasics.mesh(Rect2d(0, 0, 1, 1))
+    m3 = GeometryBasics.mesh(Rect3f(Vec3f(0), Vec3f(1)))
+    mn = convert_arguments(Makie.Mesh, m3)[1] # (with normals as a plain vector)
+    for m in (m2, m3, mn)
+        @test is_concrete(typeof(m))
+    end
+    @test !hasproperty(convert_arguments(Makie.Mesh, m2)[1], :normal)
+    @test hasproperty(convert_arguments(Makie.Mesh, m3)[1], :normal)
+    @test convert_arguments(Makie.Mesh, mn)[1] === mn
+
+    # same result as GeometryBasics.mesh(...)
+    n = Makie.normals(coordinates(m3), faces(m3), normaltype = Vec3f)
+    expected = GeometryBasics.mesh(m3, facetype = eltype(faces(m3)), pointtype = Point3f, normal = n)
+    @test convert_arguments(Makie.Mesh, m3)[1] == expected
+    m3d = GeometryBasics.mesh(Rect3d(Vec3d(0), Vec3d(1)))
+    @test eltype(convert_arguments(Makie.Mesh, m3d)[1].position) == Point3d
+    mi = GeometryBasics.Mesh(Point2{Int}[(0, 0), (1, 0), (1, 1)], GLTriangleFace[(1, 2, 3)])
+    @test eltype(convert_arguments(Makie.Mesh, mi)[1].position) == Point2d
+
+    # vectors of meshes are merged with the type of their elements, with a view per mesh
+    for ms in ([GeometryBasics.mesh(Rect2d(i, 0, 1, 1)) for i in 1:3], [m3, m3], [mn, mn, mn])
+        @test is_concrete(typeof(ms))
+        merged = convert_arguments(Makie.Mesh, ms)[1]
+        converted = map(ms) do m
+            mesh = convert_arguments(Makie.Mesh, m)[1]
+            return GeometryBasics.Mesh(vertex_attributes(mesh), faces(mesh), UnitRange{UInt32}[])
+        end
+        @test merged == merge(converted)
+        @test length(merged.views) == length(ms)
+        @test typeof(merged) == typeof(convert_arguments(Makie.Mesh, ms[1:1])[1])
+    end
+    # an empty vector converts to an empty mesh of the type of the others
+    empty_mesh = convert_arguments(Makie.Mesh, typeof(m2)[])[1]
+    @test isempty(faces(empty_mesh)) && isempty(coordinates(empty_mesh))
+    @test typeof(empty_mesh) == typeof(convert_arguments(Makie.Mesh, [m2, m2])[1])
+    @test isempty(faces(convert_arguments(Makie.Mesh, GeometryBasics.AbstractGeometry{2}[])[1]))
+
+    # the outline of polygons
+    pol = Polygon(Point2d[(0, 0), (4, 0), (4, 4), (0, 4)], [Point2d[(1, 1), (2, 1), (2, 2)]])
+    mpol = MultiPolygon([pol, pol])
+    for p in (pol, mpol, [pol, pol])
+        @test only(Base.return_types(Makie.to_lines, Tuple{typeof(p)})) == Tuple{Vector{Point2{Float64}}, Vector{Int}}
+    end
+    @test isequal(Makie.to_lines(pol)[1], convert_arguments(Lines, pol)[1])
+    @test isequal(Makie.to_lines(mpol)[1], convert_arguments(Lines, mpol)[1])
+end

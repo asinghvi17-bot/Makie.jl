@@ -262,7 +262,8 @@ function convert_dim_value(conv, attr, value, last_value, element_index)
 end
 
 function convert_dim_value(conv, attr, points::AbstractArray{<:VecTypes}, last_value, element_index)
-    isempty(points) && return Float64[]
+    # (of the type of the components, as for other `points`, so that the result type does not depend on `isempty`)
+    isempty(points) && return eltype(eltype(points))[]
     dim_value = [p[element_index] for p in points]
     last_dim_value = last_value === nothing ? nothing : [p[element_index] for p in last_value]
     return convert_dim_value(conv, attr, dim_value, last_dim_value)
