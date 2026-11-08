@@ -285,22 +285,72 @@ as true.
 See also: [`And`](@ref), [`Or`](@ref), [`Not`](@ref), [`Exclusively`](@ref),
 `&`, `|`, `!`
 """
-ispressed(events::Events, mb::Mouse.Button, waspressed = nothing) = mb in events.mousebuttonstate || mb == waspressed
-ispressed(events::Events, key::Keyboard.Button, waspressed = nothing) = key in events.keyboardstate || key == waspressed
-ispressed(parent, result::Bool, waspressed = nothing) = result
+function ispressed(parent, x, waspressed = nothing)
+    return _ispressed(parent, x, waspressed)::Bool
+end
 
-ispressed(parent, mb::Mouse.Button, waspressed = nothing) = ispressed(events(parent), mb, waspressed)
-ispressed(parent, key::Keyboard.Button, waspressed = nothing) = ispressed(events(parent), key, waspressed)
+# `ispressed` is deliberately one method which branches on the closed set of input types (`IsPressedInputType`) with
+# `isa`, instead of one method per type. The button usually reaches a call site as a `Union` of all of them
+# (e.g. `Observable{IsPressedInputType}`) or as `Any` (attributes), so inference sees every `ispressed` method as a
+# candidate. That is a dynamic dispatch, which static compilation (juliac `--trim=safe`) cannot resolve. A single
+# method resolves for any argument type.
+function _ispressed(parent, x, waspressed)::Bool
+    x isa Bool && return x
+    x isa Keyboard.Button && return x in _events(parent).keyboardstate || x == waspressed
+    x isa Mouse.Button && return x in _events(parent).mousebuttonstate || x == waspressed
+    # Boolean Operator evaluation
+    x isa And && return _ispressed(parent, x.left, waspressed) && _ispressed(parent, x.right, waspressed)
+    x isa Or && return _ispressed(parent, x.left, waspressed) || _ispressed(parent, x.right, waspressed)
+    x isa Not && return !_ispressed(parent, x.x, waspressed)
+    x isa Exclusively && return _ispressed_exclusively(_events(parent), x, waspressed)
+    x isa Tuple && return _all_ispressed(parent, x, waspressed)
+    return _ispressed_collection(parent, x, waspressed)
+end
 
-# Boolean Operator evaluation
-ispressed(parent, op::And, waspressed = nothing) = ispressed(parent, op.left, waspressed) && ispressed(parent, op.right, waspressed)
-ispressed(parent, op::Or, waspressed = nothing) = ispressed(parent, op.left, waspressed) || ispressed(parent, op.right, waspressed)
-ispressed(parent, op::Not, waspressed = nothing) = !ispressed(parent, op.x, waspressed)
-ispressed(parent, op::Exclusively, waspressed = nothing) = ispressed(events(parent), op, waspressed)
-ispressed(e::Events, op::Exclusively, waspressed::Union{Mouse.Button, Keyboard.Button}) = op.x == union(e.keyboardstate, e.mousebuttonstate, waspressed)
-ispressed(e::Events, op::Exclusively, waspressed = nothing) = op.x == union(e.keyboardstate, e.mousebuttonstate)
+# Vectors and Sets are only iterable (statically compiled, in Wasm) with a concrete element type. These are the ones
+# that occur for a collection of buttons: `Set((Keyboard.a, Mouse.left))` is a `Set{Enum{Int32}}`, `[a & b, c | d]`
+# a `Vector{BooleanOperator}`, and `Any` covers everything else.
+const _COLLECTION_ELTYPES = (
+    Keyboard.Button, Mouse.Button, Enum{Int32}, Union{Keyboard.Button, Mouse.Button}, BooleanOperator, Bool, Any,
+)
+@eval function _ispressed_collection(parent, x, waspressed)::Bool
+    $(
+        (
+            :(x isa $(C{T}) && return _all_ispressed(parent, x, waspressed))
+                for C in (Vector, Set) for T in _COLLECTION_ELTYPES
+        )...
+    )
+    throw(ArgumentError("`ispressed` is not defined for this type of button, see `IsPressedInputType`."))
+end
 
-# collections
-ispressed(parent, set::Set, waspressed = nothing) = all(x -> ispressed(parent, x, waspressed), set)
-ispressed(parent, set::Vector, waspressed = nothing) = all(x -> ispressed(parent, x, waspressed), set)
-ispressed(parent, set::Tuple, waspressed = nothing) = all(x -> ispressed(parent, x, waspressed), set)
+_events(e::Events) = e
+_events(parent) = events(parent)
+
+# `op.x == union(keyboardstate, mousebuttonstate[, waspressed])`, without the Set of the two enum types
+function _ispressed_exclusively(e::Events, op::Exclusively, waspressed)::Bool
+    required = op.x
+    npressed = 0
+    for b in e.keyboardstate
+        b in required || return false
+        npressed += 1
+    end
+    for b in e.mousebuttonstate
+        b in required || return false
+        npressed += 1
+    end
+    if waspressed isa Keyboard.Button
+        waspressed in required || return false
+        waspressed in e.keyboardstate || (npressed += 1)
+    elseif waspressed isa Mouse.Button
+        waspressed in required || return false
+        waspressed in e.mousebuttonstate || (npressed += 1)
+    end
+    return npressed == length(required)
+end
+
+function _all_ispressed(parent, collection, waspressed)::Bool
+    for x in collection
+        _ispressed(parent, x, waspressed) || return false
+    end
+    return true
+end
