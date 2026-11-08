@@ -247,17 +247,16 @@ function Base.show(io::IO, ::MIME"text/plain", graph::ComputeGraph)
 end
 
 
-function Base.showerror(io::IO, re::ResolveException{SelectException})
-    trace_error(io, re.start, re.error.edge)
-    print(io, "Due to ")
-    printstyled(io, "ERROR: ", color = :light_red, bold = true)
-    Base.showerror(io, re.error)
-end
-
 Base.showerror(io::IO, se::SelectException) = print(io, se.msg)
 
+# Dispatches on the wrapped error rather than the type parameter, which may be
+# wider than the error's type (e.g. `ResolveException{Exception}`)
 function Base.showerror(io::IO, re::ResolveException)
-    trace_error(io, re.start)
+    if re.error isa SelectException
+        trace_error(io, re.start, re.error.edge)
+    else
+        trace_error(io, re.start)
+    end
     print(io, "Due to ")
     printstyled(io, "ERROR: ", color = :light_red, bold = true)
     Base.showerror(io, re.error)
