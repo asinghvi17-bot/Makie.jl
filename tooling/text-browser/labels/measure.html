@@ -1,0 +1,8 @@
+<!doctype html><meta charset="utf-8">
+<script type="module">
+// the four Heros faces Makie bundles, registered like an app would (@font-face equivalents)
+const faces = [['TeXGyreHerosMakie-Regular.otf', 'normal', '400'], ['TeXGyreHerosMakie-Bold.otf', 'normal', '700'],
+               ['TeXGyreHerosMakie-Italic.otf', 'italic', '400'], ['TeXGyreHerosMakie-BoldItalic.otf', 'italic', '700']];
+for (const [f, style, weight] of faces) { const ff = new FontFace('TeX Gyre Heros Makie', `url(/fonts/${f})`, { style, weight }); await ff.load(); document.fonts.add(ff); }
+window.ready = true;
+</script>

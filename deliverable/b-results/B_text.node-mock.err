@@ -1,0 +1,4 @@
+(node:13224) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+imports: wasi_snapshot_preview1, julia_io, wasm_host
+host: {"inFlight":0,"maxInFlight":1,"textJobs":31,"glyphJobs":30}

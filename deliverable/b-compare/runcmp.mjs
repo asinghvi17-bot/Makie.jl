@@ -1,0 +1,14 @@
+import { chromium, firefox, webkit } from '/home/factory/.factory/profiles/personal/tmp/140d0fdd-d7b4-4f4d-8783-448174a8910d.tmp/pw/node_modules/playwright/index.mjs';
+import { serve } from './serve.mjs'; import fs from 'node:fs';
+const which = process.argv[2] ?? 'chromium';
+const { s, port } = await serve(process.cwd());
+const bt = { chromium, firefox, webkit }[which];
+const b = await bt.launch(which === 'chromium' ? { args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] } : {});
+const p = await b.newPage();
+p.on('console', (m) => console.error('[page]', m.text())); p.on('pageerror', (e) => console.error('[pageerror]', e.message));
+await p.goto(`http://127.0.0.1:${port}/cmp.html`);
+await p.waitForFunction(() => window.__result, null, { timeout: 120000 });
+const r = await p.evaluate(() => window.__result);
+fs.writeFileSync(`cmp_${which}.json`, JSON.stringify(r, null, 1));
+console.log(JSON.stringify(r, null, 1).slice(0, 6000));
+await b.close(); s.close();

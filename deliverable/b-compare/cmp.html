@@ -1,0 +1,76 @@
+<!doctype html><meta charset="utf-8"><title>canvas vs freetype</title>
+<style>@font-face{font-family:"TeX Gyre Heros Makie";src:url(TeXGyreHerosMakie-Regular.otf) format("opentype");}</style>
+<body><canvas id=c width=10 height=10></canvas>
+<script type="module">
+const FAMILY = '"TeX Gyre Heros Makie"';
+// ---- the host's measure + raster, as the adapter has them (WasmHost js/browser/text.mjs) ----
+const mc = new OffscreenCanvas(8, 8).getContext('2d');
+function measure(cp, px) {
+  mc.font = `${px}px ${FAMILY}`; mc.textBaseline = 'alphabetic'; mc.textAlign = 'left';
+  const m = mc.measureText(String.fromCodePoint(cp));
+  return { adv: m.width, L: m.actualBoundingBoxLeft, R: m.actualBoundingBoxRight, A: m.actualBoundingBoxAscent, D: m.actualBoundingBoxDescent,
+           fA: m.fontBoundingBoxAscent, fD: m.fontBoundingBoxDescent };
+}
+function raster(cp, px) {
+  const m = measure(cp, px);
+  const padL = Math.ceil(Math.max(0, m.L)) + 2, padT = Math.ceil(Math.max(0, m.A)) + 2;
+  const W = padL + Math.ceil(Math.max(0, m.R)) + 3, H = padT + Math.ceil(Math.max(0, m.D)) + 3;
+  const cv = new OffscreenCanvas(Math.max(W, 1), Math.max(H, 1)); const ctx = cv.getContext('2d', { willReadFrequently: true });
+  ctx.font = `${px}px ${FAMILY}`; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = '#fff';
+  ctx.fillText(String.fromCodePoint(cp), padL, padT);
+  const d = ctx.getImageData(0, 0, W, H).data;
+  let x0 = W, x1 = -1, y0 = H, y1 = -1;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (d[(y * W + x) * 4 + 3] > 0) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  if (x1 < 0) return { w: 0, h: 0, left: 0, top: 0, cov: new Uint8Array(0), m };
+  const w = x1 - x0 + 1, h = y1 - y0 + 1, cov = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) cov[y * w + x] = d[((y + y0) * W + x + x0) * 4 + 3];
+  return { w, h, left: x0 - padL, top: padT - y0, cov, m };   // (FreeType's bitmap_left / bitmap_top convention)
+}
+const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+await new FontFace('TeX Gyre Heros Makie', 'url(TeXGyreHerosMakie-Regular.otf)').load().then((f) => document.fonts.add(f));
+await document.fonts.load(`16px ${FAMILY}`);
+const ref = await (await fetch('ft_ref.json')).json();
+const PX = ref.px;
+const rows = [];
+const stat = (a) => { const s = [...a].sort((x, y) => x - y); return { mean: a.reduce((p, c) => p + c, 0) / a.length, p50: s[a.length >> 1], p95: s[Math.floor(a.length * 0.95)], max: s[a.length - 1] }; };
+const e = { adv: [], bx: [], by: [], w: [], h: [], advPx: [] };       // em/1000 units
+const e320 = { adv: [], bx: [], by: [], w: [], h: [] };
+const eSz = {};
+for (const g of ref.glyphs) {
+  const m = measure(g.c, 2000);                                          // at 2000 px: 1/2000 em resolution
+  const mx = { adv: m.adv / 2000, bx: -m.L / 2000, by: m.A / 2000, w: (m.L + m.R) / 2000, h: (m.A + m.D) / 2000 };
+  for (const k of ['adv', 'bx', 'by', 'w', 'h']) e[k].push(Math.abs(mx[k] - g[k]) * 1000);
+  for (const px of [12, 64, 320]) {
+    const mm = measure(g.c, px); (eSz[px] ??= { adv: [], bx: [], by: [], w: [], h: [] });
+    const mmx = { adv: mm.adv / px, bx: -mm.L / px, by: mm.A / px, w: (mm.L + mm.R) / px, h: (mm.A + mm.D) / px };
+    for (const k of ['adv', 'bx', 'by', 'w', 'h']) eSz[px][k].push(Math.abs(mmx[k] - g[k]) * 1000);
+  }
+  const r = raster(g.c, PX);
+  const fb = b64(g.bmp);
+  // compare coverage in the common frame (origin-relative); FT bitmap: (left, top, bw, bh), row-major
+  const x0 = Math.min(r.left, g.left), y1 = Math.max(r.top, g.top);
+  const x1 = Math.max(r.left + r.w, g.left + g.bw), y0 = Math.min(r.top - r.h, g.top - g.bh);
+  let sum = 0, n = 0, mx2 = 0, inkA = 0, inkB = 0, inter = 0;
+  for (let y = y1; y > y0; y--) for (let x = x0; x < x1; x++) {
+    const a = (x >= r.left && x < r.left + r.w && y <= r.top && y > r.top - r.h) ? r.cov[(r.top - y) * r.w + (x - r.left)] : 0;
+    const b = (x >= g.left && x < g.left + g.bw && y <= g.top && y > g.top - g.bh) ? fb[(g.top - y) * g.bw + (x - g.left)] : 0;
+    const dlt = Math.abs(a - b); sum += dlt; n++; if (dlt > mx2) mx2 = dlt; inkA += a; inkB += b; inter += Math.min(a, b);
+  }
+  rows.push({ c: g.c, ch: String.fromCodePoint(g.c), ft: { left: g.left, top: g.top, w: g.bw, h: g.bh }, br: { left: r.left, top: r.top, w: r.w, h: r.h },
+              bboxEq: r.left === g.left && r.top === g.top && r.w === g.bw && r.h === g.bh, dW: r.w - g.bw, dH: r.h - g.bh, dLeft: r.left - g.left, dTop: r.top - g.top,
+              meanAbs: n ? sum / n : 0, maxAbs: mx2, iou: (inkA + inkB - inter) ? inter / (inkA + inkB - inter) : 1, inkRatio: inkB ? inkA / inkB : 1 });
+}
+const fm = measure(65, 1000);
+const out = {
+  ua: navigator.userAgent,
+  fontBox: { ascender_ft: ref.ascender, descender_ft: ref.descender, fontBoundingBoxAscent_at1000: fm.fA, fontBoundingBoxDescent_at1000: fm.fD },
+  metricsErr_at2000_em1000: Object.fromEntries(Object.entries(e).filter(([k]) => k !== 'advPx').map(([k, v]) => [k, stat(v)])),
+  metricsErr_bySize: Object.fromEntries(Object.entries(eSz).map(([px, o]) => [px, Object.fromEntries(Object.entries(o).map(([k, v]) => [k, stat(v)]))])),
+  bitmap: { glyphs: rows.length, bboxIdentical: rows.filter((r) => r.bboxEq).length,
+            dW: stat(rows.map((r) => Math.abs(r.dW))), dH: stat(rows.map((r) => Math.abs(r.dH))), dLeft: stat(rows.map((r) => Math.abs(r.dLeft))), dTop: stat(rows.map((r) => Math.abs(r.dTop))),
+            meanAbsCoverage: stat(rows.map((r) => r.meanAbs)), maxAbsCoverage: stat(rows.map((r) => r.maxAbs)), iou: stat(rows.map((r) => r.iou)), inkRatio: stat(rows.map((r) => r.inkRatio)) },
+  worst: rows.slice().sort((a, b) => a.iou - b.iou).slice(0, 6),
+};
+window.__result = out;
+document.title = 'done';
+</script>
