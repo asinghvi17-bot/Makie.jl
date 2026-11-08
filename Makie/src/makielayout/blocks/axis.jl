@@ -896,7 +896,7 @@ function reset_limits!(ax::Axis; xauto = true, yauto = true)
     prev_sharedxlimits = ax.sharedxlimits[]
     prev_sharedylimits = ax.sharedylimits[]
 
-    ax.limits::Computed = ax.limits[]
+    ax.limits = ax.limits[]
 
     # recover previous limits for each *auto = false
     # Writes to local limits to re-trigger axis linking
