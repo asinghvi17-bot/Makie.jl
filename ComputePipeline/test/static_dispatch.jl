@@ -88,7 +88,7 @@ end
 
         # hooks resolve to the generated methods
         te = graph.b.parent.typed_edge[]
-        @test which(ComputePipeline.resolve_typed_edge!, (ComputePipeline.TypedEdge,)).module === StaticDispatch
+        @test which(ComputePipeline.resolve_edge_callback!, (ComputeEdge{ComputeGraph},)).module === StaticDispatch
         @test which(ComputePipeline.update_input_output!, (typeof(graph.inputs[:a]),)).module === StaticDispatch
 
         @test @invokelatest(static_test_updates!(graph, child, obs, updates)) == reference[2:end]
@@ -105,7 +105,7 @@ end
         StaticDispatch.uninstall!()
     end
     @test !StaticDispatch.isinstalled()
-    @test which(ComputePipeline.resolve_typed_edge!, (ComputePipeline.TypedEdge,)).module === ComputePipeline
+    @test which(ComputePipeline.resolve_edge_callback!, (ComputeEdge{ComputeGraph},)).module === ComputePipeline
 
     # dynamic behaviour is back
     graph, child = build_static_test_graph()
@@ -160,6 +160,141 @@ end
         @test @invokelatest(child.child_out[]) == 11.0
         err = @invokelatest catch_error(() -> graph.sum[])
         @test err isa ResolveException && err.error isa StaticDispatchError
+    finally
+        StaticDispatch.uninstall!()
+    end
+end
+
+function union_slot_steps!(graph, calls)
+    out = Int[]
+    for a in (1.2, 1.2, 1.4, -1.0)
+        graph.a = a
+        graph.down[]
+        push!(out, calls[])
+    end
+    return out, graph.down[]
+end
+
+@testset "install! with Union-typed slots" begin
+    function build(calls)
+        graph = ComputeGraph()
+        add_input!(graph, :a, -1.0)
+        # :u is typed Union{Nothing, Float64}; only `nothing` is seen before install!
+        map!(a -> Ref{Union{Nothing, Float64}}(a < 0 ? nothing : round(a)), graph, :a, :u)
+        map!(u -> (calls[] += 1; something(u, -1.0)), graph, :u, :down)
+        graph.down[]
+        graph.a = -2.0
+        graph.down[]
+        return graph
+    end
+    # reference: 1.2 -> :u = 1.0, same input again, 1.4 -> :u still 1.0, -1.0 -> nothing
+    calls = Ref(0)
+    graph = build(calls)
+    reference = union_slot_steps!(graph, calls)
+    @test reference == ([2, 2, 2, 3], -1.0)
+
+    calls = Ref(0)
+    graph = build(calls)
+    try
+        StaticDispatch.install!(graph)
+        @test @invokelatest(union_slot_steps!(graph, calls)) == reference
+    finally
+        StaticDispatch.uninstall!()
+    end
+end
+
+@testset "install! finds graphs sharing an Observable" begin
+    obs = Observable(1.0)
+    g1 = ComputeGraph()
+    add_input!(g1, :x, obs)
+    map!(x -> 2x, g1, :x, :y)
+    g2 = ComputeGraph()
+    add_input!(g2, :x, obs)
+    map!(x -> x + 1, g2, :x, :z)
+    # g3 is fed by an Observable of a g1 node
+    g3 = ComputeGraph()
+    add_input!(g3, :y, ComputePipeline.get_observable!(g1, :y))
+    map!(y -> y / 2, g3, :y, :w)
+    for v in (1.0, 2.0)
+        obs[] = v
+        g1.y[], g2.z[], g3.w[]
+    end
+    try
+        shapes = StaticDispatch.install!(g1)
+        @test length(shapes.graphs) == 3
+        @invokelatest setindex!(obs, 3.0)
+        @test @invokelatest(g1.y[]) == 6.0
+        @test @invokelatest(g2.z[]) == 4.0
+        @test @invokelatest(g3.w[]) == 3.0
+    finally
+        StaticDispatch.uninstall!()
+    end
+end
+
+struct StaticDispatchTestEdge <: ComputePipeline.AbstractEdge end
+
+@testset "install! records methods if evaluation fails" begin
+    defs = [
+        :(ComputePipeline.other_edge(f, edge::$StaticDispatchTestEdge) = :added),
+        :(error("evaluation failed")),
+    ]
+    @test_throws ErrorException StaticDispatch.eval_tracked!(StaticDispatch, defs)
+    try
+        @test StaticDispatch.isinstalled()
+        @test @invokelatest(ComputePipeline.other_edge(identity, StaticDispatchTestEdge())) === :added
+    finally
+        StaticDispatch.uninstall!()
+    end
+    @test !StaticDispatch.isinstalled()
+    @test @invokelatest(ComputePipeline.other_edge(identity, StaticDispatchTestEdge())) isa StaticDispatchTestEdge
+end
+
+@testset "install! keeps ResolveException{SelectException}" begin
+    graph = ComputeGraph()
+    add_input!(graph, :idx, 1)
+    add_input!(graph, :a, 1.0)
+    add_input!(graph, :b, 2.0)
+    ComputePipeline.select!(graph, :idx, [:a, :b], :out)
+    graph.out[]
+    graph.idx = 5
+    native = catch_error(() -> graph.out[])
+    graph.idx = 2
+    graph.out[]
+    try
+        StaticDispatch.install!(graph)
+        graph.idx = 5
+        err = @invokelatest catch_error(() -> graph.out[])
+        @test native isa ResolveException{ComputePipeline.SelectException}
+        @test err isa ResolveException{ComputePipeline.SelectException}
+        @test @invokelatest(sprint(showerror, err)) == sprint(showerror, native)
+    finally
+        StaticDispatch.uninstall!()
+    end
+    # the generic showerror handles a widened type parameter the same way
+    wide = ResolveException{Exception}(native.start, native.error)
+    @test sprint(showerror, wide) == sprint(showerror, native)
+end
+
+@testset "StaticDispatchError messages" begin
+    graph = ComputeGraph()
+    add_input!(graph, :a, 1.0)
+    map!(x -> 2x, graph, :a, :b)
+    graph.b[]
+    graph.a = 2.0
+    graph.b[]
+    try
+        StaticDispatch.install!(graph)
+        graph.a = 1 # Int instead of Float64
+        err = @invokelatest catch_error(() -> graph.b[])
+        @test err isa ResolveException{StaticDispatchError}
+        @test err.error.kind === :input
+        @test err.error.name === :a
+        @test err.error.got[2] === Int
+        @test err.error.expected == (Float64,)
+        msg = sprint(showerror, err.error)
+        @test occursin("at: a", msg)
+        @test occursin("got: ", msg) && occursin("Int64", msg)
+        @test occursin("types seen by `install!`: (Float64,)", msg)
     finally
         StaticDispatch.uninstall!()
     end

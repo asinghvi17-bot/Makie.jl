@@ -161,6 +161,10 @@ include("nesting.jl")
 
 const GLOBAL_LOCK = ReentrantLock()
 
+# The lock protecting the state of a `ComputeGraph` (and of all graphs connected to it).
+# Code outside the core resolve/update functions should lock through this.
+lock_for(@nospecialize(graph)) = GLOBAL_LOCK
+
 deref(r::RefValue) = r[]
 deref(x) = x
 
@@ -1357,11 +1361,7 @@ function locked_resolve!(edge::ComputeEdge)
         forward_selected!(edge.outputs[1], edge.inputs[idx].value)
     else
         foreach(locked_resolve!, edge.inputs)
-        if isassigned(edge.typed_edge)
-            resolve_typed_edge!(edge.typed_edge[])
-        else
-            resolve_untyped_edge!(edge)
-        end
+        resolve_edge_callback!(edge)
         fill!(edge.inputs_dirty, false)
     end
 
@@ -1373,22 +1373,23 @@ function locked_resolve!(edge::ComputeEdge)
     return
 end
 
-# Hook: called with `::TypedEdge`
-resolve_typed_edge!(@nospecialize(edge)) = locked_resolve!(edge)
-
-# Hook: called with `::ComputeEdge{ComputeGraph}` if the edge has no `TypedEdge` yet
-function resolve_untyped_edge!(edge::ComputeEdge)
-    if edge.resolved_once[]
+# Hook: called with `::ComputeEdge{ComputeGraph}` (not for select/ifelse edges).
+# Runs the edge callback through the edge's `TypedEdge`, which is created on the
+# first re-resolve.
+function resolve_edge_callback!(edge::ComputeEdge)
+    if !isassigned(edge.typed_edge)
+        if !edge.resolved_once[]
+            dynamic_resolve!(edge)
+            edge.resolved_once[] = true
+            return
+        end
         # First re-resolve: build the typed island from the values the
         # dynamic first resolve produced (without calling back), then
         # resolve it normally so the callback sees correct changed
         # flags and cached values (incl. `skip_update` semantics).
         edge.typed_edge[] = TypedEdge_no_call(edge)
-        resolve_typed_edge!(edge.typed_edge[])
-    else
-        dynamic_resolve!(edge)
-        edge.resolved_once[] = true
     end
+    locked_resolve!(edge.typed_edge[])
     return
 end
 
