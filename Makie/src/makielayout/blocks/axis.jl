@@ -904,7 +904,7 @@ function reset_limits!(ax::Axis; xauto = true, yauto = true)
     prev_sharedxlimits = ax.sharedxlimits[]::Tuple{Float64, Float64}
     prev_sharedylimits = ax.sharedylimits[]::Tuple{Float64, Float64}
 
-    ax.limits::Computed = ax.limits[]
+    ax.limits = ax.limits[]
 
     # recover previous limits for each *auto = false
     # Writes to local limits to re-trigger axis linking
