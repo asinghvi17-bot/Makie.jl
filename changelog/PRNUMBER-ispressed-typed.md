@@ -1,0 +1,3 @@
+## Changed
+
+- `ispressed` is now a single method that branches on the supported button types (`Bool`, `Keyboard.Button`, `Mouse.Button`, `And`, `Or`, `Not`, `Exclusively`, and `Tuple`, `Vector` and `Set` of those) instead of one method per type. A button read from an `Observable{IsPressedInputType}` or an `Any`-typed attribute is therefore a statically resolved call, which `cam2d!`, `Axis`, `Axis3`, `Camera3D` and `DataInspector` need for ahead-of-time compilation (`juliac --trim`). An unsupported button type now throws an `ArgumentError` instead of a `MethodError`, and `ispressed(parent, Exclusively(...), waspressed)` with a button as `waspressed` no longer errors.

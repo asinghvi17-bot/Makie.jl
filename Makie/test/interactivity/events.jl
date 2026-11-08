@@ -131,6 +131,52 @@ end
     end
 end
 
+@testset "ispressed on wide button types" begin
+    scene = Scene()
+    e = events(scene)
+    e.mousebutton[] = MouseButtonEvent(Mouse.left, Mouse.press)
+    e.keyboardbutton[] = KeyEvent(Keyboard.a, Keyboard.press)
+
+    # a parent other than Events, and values read from containers with a wide element type
+    specs = Any[
+        true, false, Keyboard.a, Keyboard.b, Mouse.left, Mouse.right,
+        (Keyboard.a, Mouse.left), [Keyboard.a, Mouse.left], Set((Keyboard.a, Mouse.left)), (Keyboard.a, Mouse.right),
+        Keyboard.a & Mouse.left, Keyboard.a | Mouse.right, !Keyboard.b, Exclusively((Keyboard.a, Mouse.left)),
+        Set([Keyboard.a]), Set{Any}([Keyboard.a, Mouse.right]), Set{Union{Keyboard.Button, Mouse.Button}}([Keyboard.a, Mouse.left]),
+        Exclusively(Keyboard.a), [Keyboard.a & Mouse.left, Keyboard.b | Mouse.left], (Keyboard.a, !Keyboard.b, true),
+    ]
+    expected = [
+        true, false, true, false, true, false, true, true, true, false, true, true, true, true,
+        true, false, true, false, true, true,
+    ]
+    for (spec, exp) in zip(specs, expected)
+        @test ispressed(scene, spec) == exp
+        @test ispressed(e, spec) == exp
+        @test ispressed(scene, Ref{Makie.IsPressedInputType}(spec)[]) == exp
+    end
+
+    # waspressed counts as pressed, also through operators and collections
+    @test ispressed(scene, Keyboard.b, Keyboard.b)
+    @test !ispressed(scene, Keyboard.b, Keyboard.c)
+    @test ispressed(scene, (Keyboard.a, Keyboard.b), Keyboard.b)
+    @test ispressed(scene, Keyboard.a & Keyboard.b, Keyboard.b)
+    @test !ispressed(scene, Exclusively((Keyboard.a, Mouse.left)), Keyboard.b)
+    @test ispressed(scene, Exclusively((Keyboard.a, Mouse.left)), Keyboard.a)
+    @test ispressed(scene, Exclusively((Keyboard.a, Mouse.left, Keyboard.b)), Keyboard.b)
+    @test !ispressed(scene, Exclusively((Keyboard.a, Mouse.left, Mouse.right)), Keyboard.b)
+
+    # button types that are not supported are still an error
+    @test_throws ArgumentError ispressed(scene, :a)
+
+    # A call with a Union (`IsPressedInputType`) or `Any` typed button (attributes, interaction fields) has to match a
+    # single method. Type inference gives up on a call with more than a few candidate methods, which makes it a
+    # dynamic dispatch that can't be compiled ahead of time (juliac --trim).
+    for T in (Makie.IsPressedInputType, Any)
+        @test length(methods(ispressed, Tuple{Scene, T})) == 1
+        @test length(methods(ispressed, Tuple{Scene, T, Union{Nothing, Mouse.Button, Keyboard.Button}})) == 1
+    end
+end
+
 @testset "copy_paste" begin
     # Hack to get clipboard() working without much setup
     @eval InteractiveUtils begin
