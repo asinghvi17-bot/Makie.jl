@@ -137,7 +137,7 @@ function Base.getindex(tree::NestedSearchTree, key::Symbol)
 end
 
 function Base.getindex(temp::TemporarySearchResult, key::Symbol)
-    new_keys = [temp.keys..., key]
+    new_keys = push!(copy(temp.keys), key)
     if has_key_in_level(temp.parent, temp.next_index, key)
         next = temp.parent.keytables[temp.next_index][key]
         return TemporarySearchResult(temp.parent, new_keys, next)
