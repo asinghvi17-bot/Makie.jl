@@ -254,6 +254,24 @@ end
     @test ax.finallimits[].widths[1] > before.widths[1]
 end
 
+@testset "Axis get_limits fallbacks" begin
+    f = Figure()
+    ax = Axis(f[1, 1])
+    lines!(ax, 1:10, 2:11)
+    tf = ax.transform_func[]
+    expected = ((1.0, 10.0), (2.0, 11.0))
+    @test Makie.get_limits(ax, tf, Makie.inverse_transform(tf)) == expected
+    # Both fallbacks warn and use the plot's data limits instead.
+    Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+        # transform without an inverse
+        @test Makie.get_limits(ax, tf, :nothing) == expected
+        @test Makie.get_limits(ax, tf, nothing) == expected
+        # inverse transform that fails on the bounding box
+        failing_inverse = (x -> error("not invertible"), identity)
+        @test Makie.get_limits(ax, tf, failing_inverse) == expected
+    end
+end
+
 # issue 3240
 @testset "Axis limits 4-tuple" begin
     fig = Figure()
