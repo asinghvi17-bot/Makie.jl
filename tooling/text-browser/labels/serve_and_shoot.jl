@@ -8,7 +8,7 @@ variant = ENV["VARIANT"]
 kw = NamedTuple()
 if variant == "c"
     m = BrowserLabels.TableMetrics(; fallback = false)
-    BrowserLabels.load!(m, "metrics.tsv")
+    BrowserLabels.load!(m, get(ENV, "METRICS", "metrics.tsv"))
     BrowserLabels.METRICS[] = m
     fig = with_theme(() -> make_figure(; kw...), text_handler = BrowserLabels.Handler())
     Makie.update_state_before_display!(fig)
@@ -24,7 +24,7 @@ app = App() do session
     return Bonito.DOM.div(fig; style = "margin:0;padding:0;width:620px;height:430px;overflow:hidden;")
 end
 server = Bonito.Server(app, "127.0.0.1", port)
-tag = string(get(ENV, "FIG", "plain"), "_", variant, get(ENV, "DPR", "1") == "1" ? "" : "_dpr" * ENV["DPR"])
+tag = string(get(ENV, "FIG", "plain"), get(ENV, "TR", "") == "" ? "" : "_gp", "_", variant, get(ENV, "DPR", "1") == "1" ? "" : "_dpr" * ENV["DPR"])
 try
     run(`node $(ENV["TB"])/labels/shoot.mjs http://127.0.0.1:$port/ $(variant == "c" ? "labels_" * get(ENV, "FIG", "plain") * "_c.json" : "-") shot_$tag $modes`)
 finally

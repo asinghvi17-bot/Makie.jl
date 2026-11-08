@@ -14,9 +14,11 @@ const b = await chromium.launch();
 const p = await b.newPage();
 await p.goto(`http://127.0.0.1:${port}/measure.html`);
 await p.waitForFunction(() => window.ready);
-const lines = await p.evaluate(async (reqs) => {
+const TR_ = process.env.TR || '';
+const lines = await p.evaluate(async ([reqs, TR]) => {
   const out = [];
   const mc = new OffscreenCanvas(8, 8).getContext('2d');
+  if (TR) mc.textRendering = TR;
   const font = (key, px) => { const [style, family] = key.split('|'); return `${style ? style + ' ' : ''}${px}px "${family}"`; };
   for (const [kind, key, ...rest] of reqs) {
     if (kind === 'F') {
@@ -33,7 +35,7 @@ const lines = await p.evaluate(async (reqs) => {
     }
   }
   return out;
-}, reqs);
+}, [reqs, TR_]);
 fs.appendFileSync(outPath, lines.join('\n') + '\n');
 console.log(`measured ${lines.length} entries`);
 await b.close(); s.close();

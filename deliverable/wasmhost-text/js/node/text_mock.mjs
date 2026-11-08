@@ -8,6 +8,7 @@ import { makeTextImports } from '../common/text.mjs';
 export function mockBackend() {
   return {
     async font() { await null; return { ascender: 0.947, descender: -0.218, height: 1.165 }; },
+    async measure({ px, text }) { await null; return [...text].length * 0.55 * px; },
     async glyph({ cp, px }) {
       await null;   // (asynchronous like a font load: the module parks)
       const advance = 0.45 + (cp % 7) * 0.05;

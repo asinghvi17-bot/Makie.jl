@@ -4,7 +4,7 @@ include(joinpath(ENV["TB"], "labels", "browser_labels.jl"))
 include(joinpath(@__DIR__, "figure.jl"))
 using .BrowserLabels
 m = BrowserLabels.TableMetrics(; fallback = get(ENV, "FALLBACK", "1") == "1")
-isfile("metrics.tsv") && BrowserLabels.load!(m, "metrics.tsv")
+mf = get(ENV, "METRICS", "metrics.tsv"); isfile(mf) && BrowserLabels.load!(m, mf)
 BrowserLabels.METRICS[] = m
 fig = with_theme(text_handler = BrowserLabels.Handler()) do
     make_figure()

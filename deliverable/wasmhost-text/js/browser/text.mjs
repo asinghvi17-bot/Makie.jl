@@ -42,6 +42,11 @@ export function browserBackend({ createCanvas = (w, h) => new OffscreenCanvas(w,
       }
       return { ascender: m.fontBoundingBoxAscent / 1000, descender: -m.fontBoundingBoxDescent / 1000, height };
     },
+    async measure({ style, family, px, text }) {
+      await ensure(style, family);
+      measureCtx.font = cssFont(style, family, px); measureCtx.textBaseline = 'alphabetic';
+      return measureCtx.measureText(text).width;
+    },
     async glyph({ style, family, cp, px }) {
       const key = `${style}|${family}|${cp}|${px}`;
       let g = glyphs.get(key);

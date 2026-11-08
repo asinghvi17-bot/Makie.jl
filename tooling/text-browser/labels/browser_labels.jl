@@ -31,15 +31,20 @@ end
 TableMetrics(; fallback = true) = TableMetrics(Dict{String, FontMetrics}(), Dict{Tuple{String, Float32, String}, Float32}(),
                                               Set{String}(), Set{Tuple{String, Float32, String}}(), fallback)
 
-const METRICS = Ref{Metrics}(TableMetrics())
+const METRICS = Ref{TableMetrics}(TableMetrics())     # (concrete: the Wasm build replaces its two methods with host calls)
 
-function fontkey(font::NativeFont)
+const KEYS = Dict{String, String}()    # FTFont.fontname => "style|family": what the browser is asked for
+
+function compute_fontkey(font::NativeFont)
     style = font.style_name
     words = String[]
     occursin("Italic", style) && push!(words, "italic")
     occursin("Bold", style) && push!(words, "bold")
     return string(join(words, ' '), "|", font.family_name)
 end
+"Natively, at build time: the browser font names of `fonts` (a Wasm build cannot read them from FreeType)."
+register_fonts!(fonts...) = foreach(f -> (KEYS[getfield(f, :fontname)] = compute_fontkey(f)), fonts)
+fontkey(font::NativeFont) = get!(() -> compute_fontkey(font), KEYS, getfield(font, :fontname))
 
 esc(s::AbstractString) = replace(s, "\\" => "\\\\", "\n" => "\\n", "\t" => "\\t")
 unesc(s::AbstractString) = replace(replace(replace(s, "\\n" => "\n"), "\\t" => "\t"), "\\\\" => "\\")
@@ -156,7 +161,51 @@ end
 
 rot_angle(q) = Float32(2 * atan(q[3], q[4]))      # (a rotation about z)
 
-"The labels of every visible `String` Text plot of `scene`; `skipped`: the blocks it cannot draw (not a String, or a non-flat rotation)."
+"""
+    labels_from!(labels, skipped, m, strs, positions, aligns, rots, offsets, fonts, sizes, colors, bboxes, baselines,
+                 lineheights, justifications, vp_origin, H)
+
+The labels of one Text plot's blocks, from the plot's resolved attributes (`input_text`, `markerspace_positions`, `align`, `rotation`,
+`offset`, `selected_font`, `fontsize`, `computed_color`, `block_bboxes`, `block_baselines`, `lineheight`, `resolved_justification`),
+into window pixels (y down; `vp_origin` is the parent scene's viewport origin, `H` the window's height). Only values go in, so the
+same function runs natively over a whole figure and in Wasm over one plot whose nodes have concrete types.
+"""
+function labels_from!(labels::Vector{Label}, skipped::Vector{String}, m::TableMetrics, strs, positions, aligns, rots, offsets, fonts, sizes,
+                      colors, bboxes, baselines, lineheights, justifications, vp_origin, H::Float32)
+    for i in eachindex(strs)
+        str = strs[i]
+        if !(str isa String)
+            push!(skipped, "not a String")
+            continue
+        end
+        font = Makie.sv_getindex(fonts, i)
+        fs = Makie.to_2d_scale(Makie.sv_getindex(sizes, i))[1]
+        rot = Makie.sv_getindex(rots, i)
+        shift = Makie.block_alignment_shift(bboxes[i], baselines[i], Makie.sv_getindex(aligns, i))
+        # (the layout frame's origin in the block's rotated frame, then the anchor: markerspace position and offset)
+        anchor = Point3f(positions[i]) + Vec3f(Makie.to_ndim(Vec3f, Makie.sv_getindex(offsets, i), 0))
+        fm = font_metrics(m, font)
+        key = fontkey(font)
+        style = split(key, '|')[1]
+        lh = fm.height * Makie.sv_getindex(lineheights, i) * fs
+        lines = split(str, '\n')
+        just = Float32(Makie.sv_getindex(justifications, i))
+        ws = Float32[text_width(m, font, fs, l) for l in lines]
+        maxw = maximum(ws)
+        col = Makie.to_color(Makie.sv_getindex(colors, i))
+        for (j, l) in enumerate(lines)
+            isempty(l) && continue
+            p0 = Vec3f((maxw - ws[j]) * just, -(j - 1) * lh, 0) - shift
+            q = rot * p0
+            x = anchor[1] + q[1] + vp_origin[1]
+            y = anchor[2] + q[2] + vp_origin[2]
+            push!(labels, Label(String(l), x, H - y, fs, RGBAf(col), rot_angle(rot), split(key, '|')[2], String(style), fm.ascender, fm.descender, ws[j]))
+        end
+    end
+    return labels
+end
+
+"The labels of every visible Text plot of `scene` (`skipped`: blocks that are not Strings, and so not labels)."
 function collect_labels(scene::Makie.Scene)
     m = METRICS[]
     labels = Label[]
@@ -164,58 +213,25 @@ function collect_labels(scene::Makie.Scene)
     H = Float32(widths(Makie.viewport(scene)[])[2])
     for p in text_plots(scene)
         p.visible[] || continue
-        strs = p.input_text[]
-        blocks = p.text_blocks[]
-        bboxes = p.block_bboxes[]; baselines = p.block_baselines[]
-        positions = p.markerspace_positions[]
-        aligns, rots, offs = p.align[], p.rotation[], p.offset[]
-        fonts = p.selected_font[]
-        sizes = p.fontsize[]
-        colors = p.computed_color[]
-        psc = Makie.parent_scene(p)
-        vp = Makie.viewport(psc)[]
-        for (i, str) in enumerate(strs)
-            if !(str isa String)
-                push!(skipped, string(typeof(str)))
-                continue
-            end
-            font = Makie.sv_getindex(fonts, i)
-            fs = Makie.to_2d_scale(Makie.sv_getindex(sizes, i))[1]
-            rot = Makie.sv_getindex(rots, i)
-            shift = Makie.block_alignment_shift(bboxes[i], baselines[i], Makie.sv_getindex(aligns, i))
-            # (the layout frame's origin in the block's rotated frame, then the anchor: markerspace position and offset)
-            anchor = Point3f(positions[i]) + Vec3f(Makie.to_ndim(Vec3f, Makie.sv_getindex(offs, i), 0))
-            fm = font_metrics(m, font)
-            lh = fm.height * Makie.sv_getindex(p.lineheight[], i) * fs
-            lines = split(str, '\n')
-            just = Float32(Makie.sv_getindex(p.resolved_justification[], i))
-            ws = Float32[text_width(m, font, fs, l) for l in lines]
-            maxw = maximum(ws)
-            col = Makie.to_color(Makie.sv_getindex(colors, i))
-            for (j, l) in enumerate(lines)
-                isempty(l) && continue
-                p0 = Vec3f((maxw - ws[j]) * just, -(j - 1) * lh, 0) - shift
-                q = rot * p0
-                x = anchor[1] + q[1] + vp.origin[1]
-                y = anchor[2] + q[2] + vp.origin[2]
-                push!(labels, Label(String(l), x, H - y, fs, RGBAf(col), rot_angle(rot), font.family_name,
-                                    split(fontkey(font), '|')[1], fm.ascender, fm.descender, ws[j]))
-            end
-        end
+        vp = Makie.viewport(Makie.parent_scene(p))[]
+        labels_from!(labels, skipped, m, p.input_text[], p.markerspace_positions[], p.align[], p.rotation[], p.offset[], p.selected_font[],
+                     p.fontsize[], p.computed_color[], p.block_bboxes[], p.block_baselines[], p.lineheight[], p.resolved_justification[],
+                     Point2f(vp.origin), H)
     end
     return labels, skipped
 end
 
 jsonstr(s::AbstractString) = string('"', replace(s, "\\" => "\\\\", "\"" => "\\\"", "\n" => "\\n", "\t" => "\\t"), '"')
+f64(x) = Float64(x)
 function labels_json(labels::Vector{Label}, size::Tuple{Real, Real})
     io = IOBuffer()
-    print(io, "{\"width\":", size[1], ",\"height\":", size[2], ",\"labels\":[")
+    print(io, "{\"width\":", f64(size[1]), ",\"height\":", f64(size[2]), ",\"labels\":[")
     for (i, l) in enumerate(labels)
         i > 1 && print(io, ",")
         c = l.color
-        print(io, "{\"text\":", jsonstr(l.text), ",\"x\":", round(l.x; digits = 3), ",\"y\":", round(l.y; digits = 3), ",\"size\":", l.size,
-              ",\"color\":[", c.r, ",", c.g, ",", c.b, ",", c.alpha, "],\"angle\":", round(l.angle; digits = 5), ",\"family\":", jsonstr(l.family),
-              ",\"style\":", jsonstr(l.style), ",\"ascender\":", l.ascender, ",\"descender\":", l.descender, ",\"width\":", round(l.width; digits = 3), "}")
+        print(io, "{\"text\":", jsonstr(l.text), ",\"x\":", f64(round(l.x; digits = 3)), ",\"y\":", f64(round(l.y; digits = 3)), ",\"size\":", f64(l.size),
+              ",\"color\":[", f64(c.r), ",", f64(c.g), ",", f64(c.b), ",", f64(c.alpha), "],\"angle\":", f64(round(l.angle; digits = 5)), ",\"family\":", jsonstr(l.family),
+              ",\"style\":", jsonstr(l.style), ",\"ascender\":", f64(l.ascender), ",\"descender\":", f64(l.descender), ",\"width\":", f64(round(l.width; digits = 3)), "}")
     end
     print(io, "]}")
     return String(take!(io))

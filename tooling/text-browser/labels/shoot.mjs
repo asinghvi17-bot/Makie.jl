@@ -16,7 +16,8 @@ for (const mode of modes.split(',')) {
   await p.goto(url);
   await p.waitForSelector('canvas', { timeout: 180000 });
   await p.waitForTimeout(5000);
-  const rect = await p.evaluate(async ({ mode, data, port }) => {
+  const rect = await p.evaluate(async ({ mode, data, port, TR }) => {
+    globalThis.__TR = TR;
     const cv = document.querySelector('canvas'); const host = cv.parentElement;
     host.style.position = 'relative';
     if (mode !== 'none') {
@@ -29,7 +30,7 @@ for (const mode of modes.split(',')) {
       await new Promise((r) => setTimeout(r, 500));
     }
     const r = cv.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height };
-  }, { mode, data, port });
+  }, { mode, data, port, TR: process.env.TR || '' });
   await p.screenshot({ path: `${outPrefix}_${mode}.png`, clip: rect });
   if (mode === 'dom') {   // PNG export as WGLMakie does it (the canvas), which does not contain DOM elements
     const png = await p.evaluate(() => document.querySelector('canvas').toDataURL('image/png'));

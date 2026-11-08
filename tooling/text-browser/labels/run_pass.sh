@@ -9,5 +9,5 @@ for i in 1 2 3; do
   n=$(grep "still missing" pass$i.log | awk '{print $3}')
   echo "pass $i: missing $n"
   [ "$n" = "0" ] && break
-  node $TB/labels/measure.mjs missing.tsv metrics.tsv
+  node $TB/labels/measure.mjs missing.tsv ${METRICS:-metrics.tsv}
 done

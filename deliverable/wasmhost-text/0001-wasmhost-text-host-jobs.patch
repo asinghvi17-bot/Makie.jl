@@ -1,0 +1,276 @@
+From 85de7dabaf89633df89957155145e3ad0e6166bd Mon Sep 17 00:00:00 2001
+From: Anshul Singhvi <anshulintheusa@gmail.com>
+Date: Sun, 8 Nov 2026 10:52:18 -0500
+Subject: [PATCH] js: text host jobs (wasm_host.text_start/text_finish): glyph
+ coverage bitmaps and metrics from Canvas2D
+
+A WasmHost text backend for programs compiled by WasmCodegen that cannot run FreeType.
+Protocol 'wasm-text 1' (js/common/text.mjs): font, extent, glyph and measure jobs,
+started without suspending and finished through a julia_io external handle (as http_start/http_finish).
+Browser backend on Canvas2D (js/browser/text.mjs); a deterministic MOCK for Node (js/node/text_mock.mjs).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ js/browser/index.mjs  |  1 +
+ js/browser/text.mjs   | 85 +++++++++++++++++++++++++++++++++++++
+ js/common/text.mjs    | 99 +++++++++++++++++++++++++++++++++++++++++++
+ js/node/index.mjs     |  1 +
+ js/node/text_mock.mjs | 30 +++++++++++++
+ 5 files changed, 216 insertions(+)
+ create mode 100644 js/browser/text.mjs
+ create mode 100644 js/common/text.mjs
+ create mode 100644 js/node/text_mock.mjs
+
+diff --git a/js/browser/index.mjs b/js/browser/index.mjs
+index 9181712..9e71425 100644
+--- a/js/browser/index.mjs
++++ b/js/browser/index.mjs
+@@ -6,3 +6,4 @@ export { decompressFile, hasFormat } from './decompress.mjs';
+ export { makeShimFs } from './fs.mjs';
+ export { makeShimJuliaIOPaths } from './julia_io_paths.mjs';
+ export { jspiGap, promisingExports, ReentryError, oneAtATime, notSuspended } from './jspi.mjs';
++export { makeBrowserText, browserBackend } from './text.mjs';
+diff --git a/js/browser/text.mjs b/js/browser/text.mjs
+new file mode 100644
+index 0000000..a5b8118
+--- /dev/null
++++ b/js/browser/text.mjs
+@@ -0,0 +1,85 @@
++// The browser's text backend for WasmHost (`common/text.mjs`): glyph coverage bitmaps and metrics from Canvas2D.
++// Fonts are the page's: register them with `FontFace` (or @font-face) before the module asks; `ensure` loads a
++// registered face on first use, which is why a glyph job is asynchronous (the module parks on a julia_io handle).
++//
++//   const text = makeBrowserText({ events, memory: () => inst.exports.memory });
++//   imports.wasm_host = { ...http.imports.wasm_host, ...text.imports.wasm_host };
++//
++// Canvas2D facts this relies on (Chromium 158, measured against FreeType on TeX Gyre Heros Makie):
++//  - `measureText().width` at 1000 or 2000 px is the font's unhinted advance, exactly (0.24/1000 em off at 2048 px, no good above 8192 px);
++//  - `actualBoundingBox*` is NOT tight (it is 0.5-1.5 % of the em larger per side), so the ink box comes from the pixels;
++//  - `fontBoundingBoxAscent/Descent` are the hhea ascender/descender; the line gap is only visible as the CSS
++//    `line-height: normal` height of a DOM element (the `height` of FreeType's face).
++import { makeJobs } from '../common/jobs.mjs';
++import { makeTextImports } from '../common/text.mjs';
++
++// (4000 px: an exact multiple of 1000-unit em fonts like the bundled CFFs, so Chromium's integer-pixel advances are exact there; 1/8000 em worst case for others. Not above 8192: Chromium misreports beyond it)
++const ADVANCE_PX = 4000;
++
++export function browserBackend({ createCanvas = (w, h) => new OffscreenCanvas(w, h), doc = globalThis.document } = {}) {
++  const measureCtx = createCanvas(8, 8).getContext('2d');
++  const cssFont = (style, family, px) => `${style ? style + ' ' : ''}${px}px "${family}"`;
++  const loaded = new Set();
++  async function ensure(style, family) {
++    const key = `${style}|${family}`;
++    if (loaded.has(key)) return;
++    const f = cssFont(style, family, 16);
++    if (doc?.fonts && !doc.fonts.check(f)) await doc.fonts.load(f);
++    loaded.add(key);
++  }
++  const glyphs = new Map();
++  return {
++    async font({ style, family }) {
++      await ensure(style, family);
++      measureCtx.font = cssFont(style, family, 1000); measureCtx.textBaseline = 'alphabetic';
++      const m = measureCtx.measureText('x');
++      let height = (m.fontBoundingBoxAscent + m.fontBoundingBoxDescent) / 1000;
++      if (doc) {   // (ascent + descent + line gap: what CSS calls `normal`)
++        const el = doc.createElement('span');
++        el.style.cssText = `position:absolute;visibility:hidden;white-space:pre;line-height:normal;font:${cssFont(style, family, 1000)}`;
++        el.textContent = 'x'; doc.body.appendChild(el);
++        height = el.getBoundingClientRect().height / 1000; el.remove();
++      }
++      return { ascender: m.fontBoundingBoxAscent / 1000, descender: -m.fontBoundingBoxDescent / 1000, height };
++    },
++    async measure({ style, family, px, text }) {
++      await ensure(style, family);
++      measureCtx.font = cssFont(style, family, px); measureCtx.textBaseline = 'alphabetic';
++      return measureCtx.measureText(text).width;
++    },
++    async glyph({ style, family, cp, px }) {
++      const key = `${style}|${family}|${cp}|${px}`;
++      let g = glyphs.get(key);
++      if (g) return g;
++      await ensure(style, family);
++      const ch = String.fromCodePoint(cp), font = cssFont(style, family, px);
++      measureCtx.font = cssFont(style, family, ADVANCE_PX); measureCtx.textBaseline = 'alphabetic';
++      const advance = measureCtx.measureText(ch).width / ADVANCE_PX;
++      measureCtx.font = font;
++      const m = measureCtx.measureText(ch);
++      // a canvas that holds the glyph with a margin (the reported box is loose, so it is only a size)
++      const padL = Math.ceil(Math.max(0, m.actualBoundingBoxLeft)) + 2, padT = Math.ceil(Math.max(0, m.actualBoundingBoxAscent)) + 2;
++      const W = padL + Math.ceil(Math.max(0, m.actualBoundingBoxRight)) + 3, H = padT + Math.ceil(Math.max(0, m.actualBoundingBoxDescent)) + 3;
++      const ctx = createCanvas(Math.max(W, 1), Math.max(H, 1)).getContext('2d', { willReadFrequently: true });
++      ctx.font = font; ctx.textBaseline = 'alphabetic'; ctx.fillStyle = '#fff';
++      ctx.fillText(ch, padL, padT);
++      const d = ctx.getImageData(0, 0, W, H).data;
++      let x0 = W, x1 = -1, y0 = H, y1 = -1;
++      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (d[(y * W + x) * 4 + 3] > 0) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
++      if (x1 < 0) g = { w: 0, h: 0, left: 0, top: 0, bitmap: new Uint8Array(0), advance, inkLeft: 0, inkTop: 0, inkW: 0, inkH: 0 };
++      else {
++        const w = x1 - x0 + 1, h = y1 - y0 + 1, bitmap = new Uint8Array(w * h);
++        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) bitmap[y * w + x] = d[((y + y0) * W + x + x0) * 4 + 3];
++        const left = x0 - padL, top = padT - y0;     // FreeType's bitmap_left / bitmap_top
++        g = { w, h, left, top, bitmap, advance, inkLeft: left / px, inkTop: top / px, inkW: w / px, inkH: h / px };
++      }
++      glyphs.set(key, g);
++      return g;
++    },
++  };
++}
++
++export function makeBrowserText({ events, memory, backend = browserBackend(), check, stats = {} }) {
++  const jobs = makeJobs(events, stats);
++  return { ...makeTextImports({ jobs, memory, backend, check, stats }), backend };
++}
+diff --git a/js/common/text.mjs b/js/common/text.mjs
+new file mode 100644
+index 0000000..d0dc89a
+--- /dev/null
++++ b/js/common/text.mjs
+@@ -0,0 +1,99 @@
++// Text host jobs for modules compiled by WasmCodegen: the glyphs and font metrics a browser (or a mock) provides
++// where FreeType cannot run. Protocol `wasm-text 1`, over `wasm_host.text_start(req, req_len) -> handle` and
++// `wasm_host.text_finish(handle, res, res_cap) -> len`, the same start/finish shape as `http_start`/`http_finish`:
++// the job runs while the module's task waits for the julia_io handle (Runtime.Host.await_handle).
++//
++//   request  (UTF-8, one field per line):
++//     "wasm-text 1"
++//     "glyph" | "extent" | "font" | "measure"
++//     style  ("" | "bold" | "italic" | "italic bold"; the CSS font-style/weight words)
++//     family (the CSS family name, as registered with the page's FontFace)
++//     glyph/extent only:  codepoint (decimal), pixel size (decimal)
++//     measure only:       pixel size (decimal), then the string (\n and \\ escaped: one line)
++//
++//   response (binary, little-endian; all i32; "em6" = em fractions times 1e6, rounded):
++//     font:   [1, status, ascender_em6, descender_em6 (negative), height_em6]
++//     glyph:  [1, status, w, h, left_px, top_px, advance_em6, ink_left_em6, ink_top_em6, ink_w_em6, ink_h_em6] then w*h bytes
++//             of coverage, row-major, top row first (FreeType's bitmap order: row 0 is the glyph's top), `left_px`/`top_px`
++//             are FreeType's bitmap_left/bitmap_top (pixels from the origin to the bitmap's left edge / top edge, y up).
++//     extent: the same without the bytes (w and h still tell the bitmap's size)
++//     measure: [1, status, width in 1/1000 px]  (what `measureText` says of the string, kerning and ligatures included)
++//     status 0 = ok, else a WASI errno; on a failure the rest is zeros and `errmsg` text follows the header.
++
++export const PROTOCOL = 'wasm-text 1';
++const enc = new TextEncoder();
++
++export function parseTextRequest(text) {
++  const f = text.split('\n');
++  if (f[0] !== PROTOCOL) throw new Error(`wasm-text: protocol ${f[0]}`);
++  const kind = f[1];
++  if (kind === 'font') return { kind, style: f[2], family: f[3] };
++  if (kind === 'measure') return { kind, style: f[2], family: f[3], px: Number(f[4]), text: f.slice(5).join('\n').replace(/\\(.)/g, (_, c) => (c === 'n' ? '\n' : c)) };
++  if (kind === 'glyph' || kind === 'extent') return { kind, style: f[2], family: f[3], cp: Number(f[4]), px: Number(f[5]) };
++  throw new Error(`wasm-text: request ${kind}`);
++}
++
++const em6 = (x) => Math.round(x * 1e6);
++
++export function formatFont(r) {
++  const out = new Uint8Array(5 * 4); const dv = new DataView(out.buffer);
++  [1, 0, em6(r.ascender), em6(r.descender), em6(r.height)].forEach((v, i) => dv.setInt32(i * 4, v, true));
++  return out;
++}
++
++export function formatMeasure(width) {
++  const out = new Uint8Array(3 * 4); const dv = new DataView(out.buffer);
++  [1, 0, Math.round(width * 1000)].forEach((v, i) => dv.setInt32(i * 4, v, true));
++  return out;
++}
++
++export function formatGlyph(r, withBitmap) {
++  const n = withBitmap ? r.w * r.h : 0;
++  const out = new Uint8Array(11 * 4 + n); const dv = new DataView(out.buffer);
++  [1, 0, r.w, r.h, r.left, r.top, em6(r.advance), em6(r.inkLeft), em6(r.inkTop), em6(r.inkW), em6(r.inkH)].forEach((v, i) => dv.setInt32(i * 4, v, true));
++  if (n) out.set(r.bitmap, 44);
++  return out;
++}
++
++export function formatError(errno, message) {
++  const m = enc.encode(String(message));
++  const out = new Uint8Array(11 * 4 + m.length); const dv = new DataView(out.buffer);
++  dv.setInt32(0, 1, true); dv.setInt32(4, errno, true);
++  out.set(m, 44);
++  return out;
++}
++
++// The adapter: `backend` has `async font({style, family}) -> {ascender, descender, height}` (em fractions) and
++// `async glyph({style, family, cp, px}) -> {w, h, left, top, bitmap, advance, inkLeft, inkTop, inkW, inkH}`,
++// `async measure({style, family, px, text}) -> width in px`.
++// `jobs` is common/jobs.mjs's `makeJobs(events, stats)`; `memory()` the module's memory.
++export function makeTextImports({ jobs, memory, backend, check = () => {}, stats = {} }) {
++  stats.textJobs ??= 0; stats.glyphJobs ??= 0;
++  const text = (off, len) => new TextDecoder().decode(new Uint8Array(memory().buffer, off >>> 0, len));
++  async function run(reqText) {
++    try {
++      const req = parseTextRequest(reqText);
++      stats.textJobs++;
++      if (req.kind === 'font') return formatFont(await backend.font(req));
++      if (req.kind === 'measure') return formatMeasure(await backend.measure(req));
++      stats.glyphJobs++;
++      return formatGlyph(await backend.glyph(req), req.kind === 'glyph');
++    } catch (err) {
++      return formatError(5 /* EIO */, err?.message ?? err);
++    }
++  }
++  function text_start(reqOff, reqLen) {
++    check();
++    const reqText = text(reqOff, reqLen);
++    return jobs.start(() => run(reqText));
++  }
++  function text_finish(h, resOff, resCap) {
++    check();
++    const bytes = jobs.result(h);
++    if (bytes === undefined) return 0;
++    if (bytes.length > resCap) return -bytes.length;
++    new Uint8Array(memory().buffer, resOff >>> 0, bytes.length).set(bytes);   // (a fresh view: memory may have grown)
++    return bytes.length;
++  }
++  return { imports: { wasm_host: { text_start, text_finish } }, stats };
++}
+diff --git a/js/node/index.mjs b/js/node/index.mjs
+index db9dcb7..a25f545 100644
+--- a/js/node/index.mjs
++++ b/js/node/index.mjs
+@@ -6,3 +6,4 @@ export { decompressFile, hasZstd } from './decompress.mjs';
+ export { detectPlatform, platformEnv, PLATFORM_VAR } from './platform.mjs';
+ export { makeMapper } from './paths.mjs';
+ export { runtime, wasiImportObject, wasiInitialize, jspiGap } from './wasi.mjs';
++export { makeMockText, mockBackend } from './text_mock.mjs';
+diff --git a/js/node/text_mock.mjs b/js/node/text_mock.mjs
+new file mode 100644
+index 0000000..317a495
+--- /dev/null
++++ b/js/node/text_mock.mjs
+@@ -0,0 +1,30 @@
++// A MOCK text backend for Node (no Canvas2D, no fonts): deterministic synthetic glyphs, only to exercise the module's
++// host calls, protocol and SDF path in `node` runs. Its glyphs are filled ellipses whose size depends on the codepoint;
++// it does not measure any font. (A Node run with a real rasterizer would use e.g. node-canvas or skia-canvas as `createCanvas`
++// of browser/text.mjs; not done here.)
++import { makeJobs } from '../common/jobs.mjs';
++import { makeTextImports } from '../common/text.mjs';
++
++export function mockBackend() {
++  return {
++    async font() { await null; return { ascender: 0.947, descender: -0.218, height: 1.165 }; },
++    async measure({ px, text }) { await null; return [...text].length * 0.55 * px; },
++    async glyph({ cp, px }) {
++      await null;   // (asynchronous like a font load: the module parks)
++      const advance = 0.45 + (cp % 7) * 0.05;
++      if (cp === 32 || cp === 10) return { w: 0, h: 0, left: 0, top: 0, bitmap: new Uint8Array(0), advance, inkLeft: 0, inkTop: 0, inkW: 0, inkH: 0 };
++      const w = Math.round(px * (0.3 + (cp % 5) * 0.05)), h = Math.round(px * (0.5 + (cp % 3) * 0.1)), left = Math.round(px * 0.05), top = h;
++      const bitmap = new Uint8Array(w * h);
++      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
++        const dx = (x + 0.5) / w * 2 - 1, dy = (y + 0.5) / h * 2 - 1;
++        bitmap[y * w + x] = dx * dx + dy * dy <= 1 ? 255 : 0;
++      }
++      return { w, h, left, top, bitmap, advance, inkLeft: left / px, inkTop: top / px, inkW: w / px, inkH: h / px };
++    },
++  };
++}
++
++export function makeMockText({ events, memory, check, stats = {} }) {
++  const jobs = makeJobs(events, stats);
++  return { ...makeTextImports({ jobs, memory, backend: mockBackend(), check, stats }) };
++}
+-- 
+2.53.0
+
