@@ -798,7 +798,19 @@ function attribute_name_allowlist()
     )
 end
 
+"""
+    validated_keys(::Type{<:Plot})
+
+Hook for ahead-of-time compilation: the keyword names which `Makie.CallsiteConstructors.generate!` ran natively
+(and so validated, with the same error) for plots of this type, or `nothing` (the default). If all the keywords of a
+plot are in it, `validate_attribute_keys` has nothing left to check at run time. Nested keywords (a `Dict` given for
+a nested attribute) are not covered: they are checked when the call site is run at build time.
+"""
+validated_keys(::Type{<:Plot}) = nothing
+
 function validate_attribute_keys(plot::P) where {P <: Plot}
+    validated = validated_keys(P)
+    validated !== nothing && all(k -> k in validated, keys(plot.kw)) && return
     allowlist = attribute_name_allowlist()
     deprecations = deprecated_attributes(P)::Tuple{Vararg{NamedTuple{(:attribute, :message, :error), Tuple{Symbol, String, Bool}}}}
     kw = plot.kw

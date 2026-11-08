@@ -17,7 +17,8 @@
         @test_throws ErrorException add_input!(graph, :in2, parent.in1)
 
         # different inputs, same function = different edge -> error
-        @test_throws ErrorException register_computation!(foo, graph, [:in1], [:merged])
+        @test_throws ComputePipeline.SameComputationError register_computation!(foo, graph, [:in1], [:merged])
+        @test occursin("with different inputs", sprint(showerror, try register_computation!(foo, graph, [:in1], [:merged]) catch e; e end))
 
         # same inputs, same function = same edge, this should work and not change the existing callback
         # TODO: How do we test that the edge does not get updated (to a new edge with the same content)?
@@ -30,7 +31,8 @@
 
         # same inputs, different function = different edge -> error
         goo(inputs, changed, cached) = (inputs[1] * inputs[2],)
-        @test_throws ErrorException register_computation!(goo, graph, [:in1, :in2], [:merged])
+        @test_throws ComputePipeline.SameComputationError register_computation!(goo, graph, [:in1, :in2], [:merged])
+        @test occursin("different callback function", sprint(showerror, try register_computation!(goo, graph, [:in1, :in2], [:merged]) catch e; e end))
     end
 end
 

@@ -1941,40 +1941,66 @@ macro ifelse_enabled(enabled_expr, disabled_expr = :())
     end
 end
 
+# The errors of `register_computation!` for outputs which already have a parent edge are
+# formatted when shown, not where they are raised (like the result errors above): formatting
+# them uses reflection and `show` on values of unknown type.
+struct SameComputationError <: Exception
+    kind::Symbol # :graph_inputs, :multiple_parents, :inputs or :callback
+    callback::Any # the new callback
+    graph::ComputeGraph
+    inputs::Vector{Computed}
+    outputs::Vector{Symbol}
+end
+
+function Base.showerror(io::IO, e::SameComputationError)
+    outputs = e.outputs
+    return if e.kind === :graph_inputs
+        input_nodes = [k for k in outputs if haskey(e.graph.inputs, k)]
+        print(io, "One or multiple edge outputs already exist as graph inputs: $input_nodes")
+    elseif e.kind === :multiple_parents
+        print(io, "Cannot register computation: $outputs already have multiple different parent compute edges.")
+    else
+        edge = e.graph.outputs[outputs[1]].parent::ComputeEdge
+        if e.kind === :inputs
+            print(
+                io, "Cannot register computation: Outputs already have a parent compute edge with different inputs.\n" *
+                    "   New: (" * join([n.name for n in e.inputs], ", ") * ") -> (" * join(outputs, ", ") * ")\n" *
+                    "   Old: (" * join([n.name for n in edge.inputs], ", ") * ") -> (" * join([n.name for n in edge.outputs], ", ") * ")"
+            )
+        else
+            # We should only care about input arg types...
+            func1, loc1 = edge_callback_to_string(e.callback, (NamedTuple, NamedTuple, Nothing))
+            func2, loc2 = edge_callback_to_string(edge)
+            print(
+                io, "Cannot register computation: The outputs already have a parent compute edge using " *
+                    "a different callback function.\n  Given: $func1 $loc1\n  Found: $func2 $loc2\n  $(methods(e.callback))"
+            )
+        end
+    end
+end
+
 function assert_same_computation(@nospecialize(f), attr::ComputeGraph, inputs, outputs)
     # Check this so we can type assert later
     if any(k -> haskey(attr.inputs, k), outputs)
-        input_nodes = [k for k in outputs if haskey(attr.inputs, k)]
-        error("One or multiple edge outputs already exist as graph inputs: $input_nodes")
+        throw(SameComputationError(:graph_inputs, f, attr, inputs, outputs))
     end
 
     e = attr.outputs[outputs[1]].parent::ComputeEdge
 
     # Check that the edge is shared
     if any(k -> attr.outputs[k].parent::ComputeEdge !== e, outputs)
-        # bad_keys = join([k for k in outputs if attr.outputs[k].parent != e], ", ")
-        error("Cannot register computation: $outputs already have multiple different parent compute edges.")
+        throw(SameComputationError(:multiple_parents, f, attr, inputs, outputs))
     end
 
     # Check that the requested inputs are the inputs of the new edge
     if length(e.inputs) != length(inputs) || e.inputs != inputs
-        error(
-            "Cannot register computation: Outputs already have a parent compute edge with different inputs.\n" *
-                "   New: (" * join([n.name for n in inputs], ", ") * ") -> (" * join(outputs, ", ") * ")\n" *
-                "   Old: (" * join([n.name for n in e.inputs], ", ") * ") -> (" * join([n.name for n in e.outputs], ", ") * ")"
-        )
+        throw(SameComputationError(:inputs, f, attr, inputs, outputs))
     end
 
     # Check that the same callback is used
     # TODO: === is much faster, but why?
     if @ifelse_enabled(e.callback != f, e.callback !== f)
-        # We should only care about input arg types...
-        func1, loc1 = edge_callback_to_string(f, (NamedTuple, NamedTuple, Nothing))
-        func2, loc2 = edge_callback_to_string(e)
-        error(
-            "Cannot register computation: The outputs already have a parent compute edge using " *
-                "a different callback function.\n  Given: $func1 $loc1\n  Found: $func2 $loc2\n  $(methods(f))"
-        )
+        throw(SameComputationError(:callback, f, attr, inputs, outputs))
     end
 
     # edge already exists so we can

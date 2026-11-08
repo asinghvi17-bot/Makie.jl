@@ -913,23 +913,68 @@ function add_attributes!(::Type{P}, graph, parent, kwargs) where {P <: Plot}
     return
 end
 
+"""
+    ConstructionTypes{Args, Converted, PlotT}()
+
+The concrete types at the `Any`-typed boundaries of `build_plot` for one plot call
+site: the type of the node `plot.args` (the arguments after `expand_dimensions`), of
+`plot.converted`, and of the plot that results.
+
+The graph nodes `args` and `converted` are `Any`-typed and the final plot type depends on
+`convert_arguments`, so inference can not follow `build_plot` any further than `Plot`.
+Ahead-of-time compilation (e.g. WasmCodegen) needs the concrete type of the plot to call
+`plot!(plot)`, `connect_plot!` etc. statically. `Makie.CallsiteConstructors` generates
+methods of [`construction_types`](@ref) for the call sites of a program (found by
+compiler inference of the program's entry points) by constructing sample plots natively.
+"""
+struct ConstructionTypes{Args, Converted, PlotT} end
+
+"""
+    construction_types(::Type{P}, ::Type{UserArgs})
+
+Hook for ahead-of-time compilation. Returns a [`ConstructionTypes`](@ref) for plots of type
+`P` (e.g. `Plot{scatter}`) constructed from a tuple of arguments of type `UserArgs`, or
+`nothing` (the default) if it is not known, in which case [`build_plot`](@ref) infers
+nothing about the result. Methods are added on the exact call site types and never
+overwrite anything, so nothing changes unless methods are generated.
+"""
+construction_types(::Type, ::Type) = nothing
+
 function build_plot(::Type{P}, parent, user_args, user_attributes) where {P}
     graph = ComputeGraph()
-
     register_arguments!(P, graph, user_attributes, user_args)
+    return finish_plot(construction_types(P, typeof(user_args)), P, graph, parent, user_attributes)
+end
+
+# Nothing is known about the types: the compiler can't infer the plot type, but FinalPlotFunc
+# may differ (e.g. qqnorm -> qqplot)
+function finish_plot(::Nothing, ::Type{P}, graph, parent, user_attributes) where {P}
     converted = graph.converted[]
     PTrait = conversion_trait(P, graph.args[]...)
     if got_converted(P, PTrait, converted) == false
         argument_error(PTrait, P, graph, user_attributes, converted)
     end
 
-    # compiler can't infer this, but FinalPlotFunc may differ (e.g. qqnorm -> qqplot)
     ArgTyp = typeof(converted)
     FinalPlotFunc = plotfunc(plottype(P, converted...))
 
     add_attributes!(Plot{FinalPlotFunc}, graph, parent, user_attributes)
 
     return Plot{FinalPlotFunc, ArgTyp}(user_attributes, graph)
+end
+
+# The types of this call site are known (`construction_types`): the same, with static types
+function finish_plot(::ConstructionTypes{Args, Converted, PlotT}, ::Type{P}, graph, parent, user_attributes) where {Args, Converted, PlotT <: Plot, P}
+    converted = graph.converted[]::Converted
+    PTrait = conversion_trait(P, (graph.args[]::Args)...)
+    if got_converted(P, PTrait, converted) == false
+        argument_error(PTrait, P, graph, user_attributes, converted)
+    end
+
+    FinalPlotFunc = plotfunc(PlotT)
+    add_attributes!(Plot{FinalPlotFunc}, graph, parent, user_attributes)
+
+    return PlotT(user_attributes, graph)
 end
 
 # should this just be connect_plot?
