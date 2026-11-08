@@ -92,7 +92,7 @@ end
 
 function _register_text_argument_conversion!(attr, input_args, user_kw)
     # Continue with _register_expand_arguments with adjusted input names
-    expanded = _register_expand_arguments!(Text, attr, [:_positions], input_args, true)
+    expanded = _register_expand_arguments!(Text, attr, [:_positions], input_args, Val(true))
 
     # And the rest of it
     _register_argument_conversions!(Text, attr, user_kw, expanded)

@@ -584,26 +584,60 @@ function convert_arguments(
 end
 
 function convert_arguments(::Type{<:Mesh}, mesh::GeometryBasics.Mesh{N, T}) where {N, T}
-    n = nothing
-    if !hasproperty(mesh, :normal)
-        n = normals(coordinates(mesh), faces(mesh), normaltype = Vec3f)
-    end
-
     # The original face type is kept so that stroking can distinguish real mesh edges
     # from edges introduced by triangulation. Triangulation happens in the backends
     # via the decomposed :faces attribute.
-    mesh = GeometryBasics.mesh(mesh, facetype = eltype(faces(mesh)), pointtype = Point{N, float_type(T)}, normal = n)
+    mesh = float_mesh(mesh, Point{N, float_type(T)}, mesh_normals(mesh))
     mesh = GeometryBasics.expand_faceviews(mesh) # TODO: can we do this (more) in-place?
 
     return (mesh,)
 end
 
-function convert_arguments(
-        T::Type{<:Mesh},
-        meshes::AbstractVector{<:GeometryBasics.AbstractGeometry{DIM}}
-    ) where {DIM}
+# Whether a mesh has normals is a property of its type (its vertex attribute names), so that every
+# mesh type converts to one mesh type. Only 3D meshes without normals get them generated.
+mesh_normals(mesh::GeometryBasics.Mesh) = mesh_normals(mesh, Val(hasproperty(mesh, :normal)))
+mesh_normals(mesh::GeometryBasics.Mesh, ::Val{true}) = nothing
+mesh_normals(mesh::GeometryBasics.Mesh, ::Val{false}) = normals(coordinates(mesh), faces(mesh), normaltype = Vec3f)
 
-    if isempty(meshes)
+# `GeometryBasics.mesh(mesh; pointtype, facetype, normal)` specializes on none of its keyword arguments and
+# cannot tell whether `normal` is `nothing`, so the type of the mesh it returns is not inferred (and it cannot
+# be compiled ahead of time). For meshes whose vertex attributes are all plain vectors it is spelled out here
+# with the types as arguments, giving the same mesh. Meshes with `FaceView`s still go through it.
+has_faceviews(::GeometryBasics.Mesh{<:Any, <:Any, <:Any, <:Any, VAT}) where {VAT} = Val(any(T -> T <: GeometryBasics.FaceView, fieldtypes(VAT)))
+
+float_mesh(mesh::GeometryBasics.Mesh, ::Type{PT}, normal) where {PT} = float_mesh(mesh, PT, normal, has_faceviews(mesh))
+function float_mesh(mesh::GeometryBasics.Mesh, ::Type{PT}, normal, ::Val{true}) where {PT}
+    return GeometryBasics.mesh(mesh, facetype = eltype(faces(mesh)), pointtype = PT, normal = normal)
+end
+# (nothing to add: the mesh itself if its positions already have the right type, as `GeometryBasics.mesh` returns it)
+float_mesh(mesh::GeometryBasics.Mesh, ::Type{PT}, ::Nothing, ::Val{false}) where {PT} = mesh_with_positions(mesh, PT)
+function float_mesh(mesh::GeometryBasics.Mesh, ::Type{PT}, normal::AbstractVector, ::Val{false}) where {PT}
+    return mesh_with_attributes(mesh, (position = GeometryBasics.decompose(PT, mesh.position), normal = normal))
+end
+
+function mesh_with_positions(mesh::GeometryBasics.Mesh{N, T}, ::Type{PT}) where {N, T, PT}
+    PT === Point{N, T} && return mesh
+    return mesh_with_attributes(mesh, (position = GeometryBasics.decompose(PT, mesh.position),))
+end
+
+# (new attributes are appended and existing ones replaced in place, as `merge` of NamedTuples does)
+function mesh_with_attributes(mesh::GeometryBasics.Mesh{N, T, FT}, attributes::NamedTuple) where {N, T, FT}
+    va = merge(GeometryBasics.vertex_attributes(mesh), attributes)
+    fs, views = GeometryBasics.decompose(FT, faces(mesh), mesh.views)
+    return GeometryBasics.Mesh(va, fs, views)
+end
+
+# (`T` is a type parameter, not a `Type{<:Mesh}` argument: the closure below captures it, and the type of a
+# captured `Type{<:Mesh}` argument is only `DataType`, which makes the `convert_arguments(T, ...)` call and
+# the element type of `map` unknown)
+function convert_arguments(
+        ::Type{T},
+        meshes::AbstractVector{<:GeometryBasics.AbstractGeometry{DIM}}
+    ) where {T <: Mesh, DIM}
+
+    # (an empty vector of a concrete element type converts to an empty mesh of the type that vectors of
+    # that type convert to)
+    if isempty(meshes) && !isconcretetype(eltype(meshes))
         return (GeometryBasics.Mesh(Point{DIM, Float32}[], GLTriangleFace[]),)
     end
     converted = map(meshes) do maybe_mesh
@@ -614,7 +648,60 @@ function convert_arguments(
         # Then we can't match e.g. per-face colors to submeshes anymore.)
         return GeometryBasics.Mesh(vertex_attributes(mesh), faces(mesh), UnitRange{UInt32}[])
     end
-    return (merge(converted),)
+    return (merge_meshes(converted),)
+end
+
+empty_vector(::Type{V}) where {V <: AbstractVector} = V()
+function empty_mesh(::Type{<:GeometryBasics.Mesh{D, T, FT, Names, VAT, FVT}}) where {D, T, FT, Names, VAT, FVT}
+    attributes = NamedTuple{Names}(map(empty_vector, fieldtypes(VAT)))
+    return GeometryBasics.Mesh(attributes, empty_vector(FVT), UnitRange{UInt32}[])
+end
+
+# `merge` of GeometryBasics picks the dimension and element type of the merged positions from the data
+# (`Point{maximum(ndims, meshes), T}`), so the type of the mesh it returns is not inferred (and it cannot be
+# compiled ahead of time). A vector of meshes of one type, without `FaceView`s, which is what the conversion
+# above produces, is merged here with that type, in the same way (the empty vector gives an empty mesh of it).
+merge_meshes(meshes::AbstractVector{<:GeometryBasics.Mesh}) = merge(meshes)
+function merge_meshes(meshes::Vector{<:GeometryBasics.Mesh{D, T, FT, Names, VAT}}) where {D, T, FT, Names, VAT}
+    return merge_meshes(meshes, Val(any(A -> A <: GeometryBasics.FaceView, fieldtypes(VAT))))
+end
+merge_meshes(meshes, ::Val{true}) = merge(meshes)
+function merge_meshes(meshes::Vector{M}, ::Val{false}) where {M <: GeometryBasics.Mesh}
+    isempty(meshes) && return empty_mesh(M)
+    m1 = meshes[1]
+    length(meshes) == 1 && return m1
+
+    attributes = map(collect, GeometryBasics.vertex_attributes(m1))
+    fs = collect(faces(m1))
+    idx = length(fs)
+    offset = length(coordinates(m1))
+    views = isempty(m1.views) ? UnitRange{UInt32}[1:idx] : copy(m1.views)
+
+    for i in 2:length(meshes)
+        mesh = meshes[i]
+        N = length(faces(mesh))
+        map(append!, attributes, GeometryBasics.vertex_attributes(mesh))
+        append!(fs, faces(mesh))
+
+        # update face indices
+        for j in (idx + 1):(idx + N)
+            fs[j] = typeof(fs[j])(fs[j] .+ offset)
+        end
+
+        # add views
+        if isempty(mesh.views)
+            push!(views, (idx + 1):(idx + N))
+        else
+            for view in mesh.views
+                push!(views, view .+ idx)
+            end
+        end
+
+        idx += N
+        offset += length(coordinates(mesh))
+    end
+
+    return GeometryBasics.Mesh(attributes, fs, views)
 end
 
 function convert_arguments(MT::Type{<:Mesh}, xyz::AbstractPolygon)
