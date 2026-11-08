@@ -1641,22 +1641,17 @@ function categorical_colors(cols::AbstractVector, categories::Integer, cycle = f
     return categorical_colors(to_color.(cols), categories, cycle)
 end
 
-function categorical_colors(cs::Union{String, Symbol}, categories::Integer, cycle = false)
+function categorical_colors(cs::Union{String, Symbol}, categories::Integer, cycle = false)::Vector{RGBAf}
     cs_string = string(cs)
-    return if cs_string in all_gradient_names
-        if haskey(ColorBrewer.colorSchemes, cs_string)
-            return to_colormap(ColorBrewer.palette(cs_string, categories))
-        else
-            return categorical_colors(to_colormap(cs_string), categories, cycle)
-        end
+    haskey(named_colormaps, cs_string) || no_gradient_error(cs)
+    palettes = get(colorbrewer_palettes, cs_string, nothing)
+    return if palettes === nothing
+        categorical_colors(to_colormap(cs_string), categories, cycle)
     else
-        error(
-            """
-            There is no color gradient named $cs.
-            See `available_gradients()` for the list of available gradients,
-            or look at https://docs.makie.org/dev/explanations/colors#Colormaps.
-            """
-        )
+        if !(1 <= categories <= length(palettes)) || isempty(palettes[categories])
+            throw(ArgumentError("Scheme $cs_string is undefined for $categories colors."))
+        end
+        copy(palettes[categories])
     end
 end
 
@@ -1667,8 +1662,8 @@ struct Reverse{T}
     data::T
 end
 
-to_colormap(r::Reverse) = reverse(to_colormap(r.data))
-to_colormap(cs::ColorScheme) = to_colormap(cs.colors)
+to_colormap(r::Reverse)::Vector{RGBAf} = reverse(to_colormap(r.data))
+to_colormap(cs::ColorScheme)::Vector{RGBAf} = to_colormap(cs.colors)
 
 
 """
@@ -1684,6 +1679,50 @@ function to_colormap(cs::Tuple{<:Union{Reverse, Symbol, AbstractString}, Real}):
     return RGBAf.(color.(cmap), alpha.(cmap) .* cs[2]) # We need to rework this to conform to the backend interface.
 end
 
+# Named colormaps are resolved through tables that are built once, while Makie is precompiled.
+# ColorSchemes' and PlotUtils' registries are `Dict{Symbol, ColorScheme}` (an abstract value type, because
+# `ColorScheme` is parameterized on its color vector type) and ColorBrewer's palettes are `JSON.Object{String, Any}`
+# holding color strings, so looking a name up in them at runtime can't be inferred and needs dynamic dispatch.
+# The tables below have concrete types and the lookups in `to_colormap` and `categorical_colors` are statically dispatched.
+# Like `all_gradient_names`, they are a snapshot: schemes registered in ColorSchemes later are not picked up.
+function build_named_colormaps()
+    table = Dict{String, Vector{RGBAf}}()
+    converted = IdDict{Any, Vector{RGBAf}}() # aliases share their colorscheme, so share the converted colors
+    for name in all_gradient_names
+        source = if name in colorbrewer_8color_names # special handling for 8 color only
+            ColorBrewer.palette(name, 8)
+        else
+            PlotUtils.get_colorscheme(Symbol(name)) # name is in plotutils_names
+        end
+        table[name] = get!(() -> to_colormap(source), converted, source)
+    end
+    return table
+end
+
+const named_colormaps = build_named_colormaps()
+
+# colorbrewer_palettes[name][n] holds the n-color palette of `name`, empty if ColorBrewer doesn't define it.
+function build_colorbrewer_palettes()
+    table = Dict{String, Vector{Vector{RGBAf}}}()
+    for (name, palettes) in ColorBrewer.colorSchemes
+        sizes = [parse(Int, n) for n in keys(palettes) if all(isdigit, n)]
+        table[name] = [n in sizes ? to_colormap(ColorBrewer.palette(name, n)) : RGBAf[] for n in 1:maximum(sizes)]
+    end
+    return table
+end
+
+const colorbrewer_palettes = build_colorbrewer_palettes()
+
+function no_gradient_error(cs)
+    return error(
+        """
+        There is no color gradient named $cs.
+        See `Makie.available_gradients()` for the list of available gradients,
+        or look at https://docs.makie.org/dev/explanations/colors#Colormaps.
+        """
+    )
+end
+
 """
     to_colormap(cs::Union{String, Symbol})::Vector{RGBAf}
 
@@ -1691,23 +1730,9 @@ A Symbol/String naming the gradient. For more on what names are available please
 For now, we support gradients from `PlotUtils` natively.
 """
 function to_colormap(cs::Union{String, Symbol})::Vector{RGBAf}
-    cs_string = string(cs)
-    return if cs_string in all_gradient_names
-        if cs_string in colorbrewer_8color_names # special handling for 8 color only
-            return to_colormap(ColorBrewer.palette(cs_string, 8))
-        else
-            # cs_string must be in plotutils_names
-            return to_colormap(PlotUtils.get_colorscheme(Symbol(cs_string)))
-        end
-    else
-        error(
-            """
-            There is no color gradient named $cs.
-            See `Makie.available_gradients()` for the list of available gradients,
-            or look at https://docs.makie.org/dev/explanations/colors#Colormaps.
-            """
-        )
-    end
+    colors = get(named_colormaps, string(cs), nothing)
+    colors === nothing && no_gradient_error(cs)
+    return copy(colors) # callers may mutate the result
 end
 
 # Handle inbuilt PlotUtils types

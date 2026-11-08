@@ -1,0 +1,3 @@
+## Changed
+
+- Named colormaps (`colormap = :viridis`, `Reverse(:viridis)`, `(:viridis, 0.5)`, `categorical_colors(:Set1, 5)`, ...) are now resolved through `Dict{String, Vector{RGBAf}}` tables built when Makie is precompiled, instead of looking up ColorSchemes' abstractly typed `Dict{Symbol, ColorScheme}` and parsing ColorBrewer's JSON color strings on every call. The returned colors are unchanged, the lookups are inferable and need no dynamic dispatch for ahead-of-time compilation (`juliac --trim`). As with `available_gradients()`, schemes registered in ColorSchemes after Makie was precompiled are not found by name.
