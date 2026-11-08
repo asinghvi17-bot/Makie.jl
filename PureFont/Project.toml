@@ -1,0 +1,6 @@
+name = "PureFont"
+uuid = "8b3a6d52-4f0e-4c1a-9e7b-2d5c1f6a9b30"
+version = "0.1.0"
+
+[compat]
+julia = "1.10"

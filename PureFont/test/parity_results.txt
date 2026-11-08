@@ -1,0 +1,28 @@
+== TeXGyreHerosMakie-Regular.otf PureFont.Font(TeX Gyre Heros Makie, Regular; 1054 glyphs, CFF)
+  face metrics: (1000, 947, -218, 1165) vs (1000, 947, -218, 1165)
+  cmap mismatches over the ASCII/Latin-1/Greek set: 0 of 248
+  metrics (all glyphs): 0 mismatches of 1054
+  metrics (test set): 0 mismatches of 248
+  bitmap @320px: (nglyph = 240, nsize = 5, maxdiff = 51, meandiff = 0.15483307846814834)
+  SDF: (nglyph = 238, nsize = 5, max = 0.19994831f0, mean = 0.0035618913487563235, mean_near_edge = 0.0036200756427893655)
+  bitmap @320px vs FT_LOAD_NO_HINTING: (nglyph = 240, nsize = 0, maxdiff = 48, meandiff = 0.12963075810473876)
+  SDF vs FT_LOAD_NO_HINTING: (nglyph = 238, nsize = 0, max = 0.19994831f0, mean = 0.0030740651961549243, mean_near_edge = 0.003313360089468094)
+== TeXGyreHerosMakie-Bold.otf PureFont.Font(TeX Gyre Heros Makie, Bold; 1054 glyphs, CFF)
+  face metrics: (1000, 947, -218, 1165) vs (1000, 947, -218, 1165)
+  cmap mismatches over the ASCII/Latin-1/Greek set: 0 of 248
+  metrics (all glyphs): 0 mismatches of 1054
+  metrics (test set): 0 mismatches of 248
+  bitmap @320px: (nglyph = 240, nsize = 12, maxdiff = 51, meandiff = 0.13573593028457906)
+  SDF: (nglyph = 238, nsize = 12, max = 0.19984245f0, mean = 0.0034710082789026556, mean_near_edge = 0.003539163653930595)
+  bitmap @320px vs FT_LOAD_NO_HINTING: (nglyph = 240, nsize = 0, maxdiff = 48, meandiff = 0.11584794133918165)
+  SDF vs FT_LOAD_NO_HINTING: (nglyph = 238, nsize = 0, max = 0.19748664f0, mean = 0.003104424046187433, mean_near_edge = 0.0033045989396262494)
+== DejaVuSans.ttf PureFont.Font(DejaVu Sans, Book; 6253 glyphs, glyf)
+  face metrics: (2048, 1901, -483, 2384) vs (2048, 1901, -483, 2384)
+  cmap mismatches over the ASCII/Latin-1/Greek set: 0 of 248
+  metrics (all glyphs): 0 mismatches of 6253
+  metrics (test set): 0 mismatches of 248
+  bitmap @320px: (nglyph = 247, nsize = 168, maxdiff = 255, meandiff = 1.2864186438743768)
+  SDF: (nglyph = 245, nsize = 168, max = 0.317286f0, mean = 0.029137044337587466, mean_near_edge = 0.03360703836617608)
+  bitmap @320px vs FT_LOAD_NO_HINTING: (nglyph = 247, nsize = 0, maxdiff = 25, meandiff = 0.05637870705689333)
+  SDF vs FT_LOAD_NO_HINTING: (nglyph = 245, nsize = 0, max = 0.24000001f0, mean = 0.0012997203311565621, mean_near_edge = 0.0015852470792697677)
+parity maxrss 788372 KB, 134.97 s
