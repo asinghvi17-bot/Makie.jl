@@ -272,6 +272,38 @@ end
     end
 end
 
+@testset "Axis limit attribute types" begin
+    f = Figure()
+    ax = Axis(f[1, 1])
+    lines!(ax, 1:10, 1:10)
+    # user limits keep their numeric type, the final limits are Float64
+    ax.limits = (1 // 2, 5 // 2, nothing, nothing)
+    @test ax.limits[] === ((1 // 2, 5 // 2), (nothing, nothing))
+    @test ax.finallimits[].origin[1] == 0.5
+    @test ax.finallimits[].widths[1] == 2.0
+    ax.limits = (1, 4, nothing, nothing)
+    @test ax.limits[] === ((1, 4), (nothing, nothing))
+    @test ax.finallimits[].origin[1] == 1.0
+    @test ax.finallimits[].widths[1] == 3.0
+    ax.limits = (nothing, nothing, 2.0f0, 8.0f0)
+    @test ax.limits[] === ((nothing, nothing), (2.0f0, 8.0f0))
+    @test ax.finallimits[].origin[2] == 2.0
+    @test ax.finallimits[].widths[2] == 6.0
+    ax.limits = ((Int32(0), 3), (1 // 4, 3.5f0))
+    @test ax.limits[] === ((Int32(0), 3), (1 // 4, 3.5f0))
+    @test ax.finallimits[] == Rect2d(0, 0.25, 3, 3.25)
+    xlims!(ax, 1 // 2, 3)
+    @test ax.limits[] === ((1 // 2, 3), (1 // 4, 3.5f0))
+    ax.limits = (nothing, nothing)
+
+    # autolimitaspect is stored as Union{Nothing, Float64}
+    ax.autolimitaspect = 1
+    @test ax.autolimitaspect[] === 1.0
+    @test ax.finallimits[].widths[1] / ax.finallimits[].widths[2] ≈ 1.0 * ax.scene.viewport[].widths[1] / ax.scene.viewport[].widths[2]
+    ax.autolimitaspect = nothing
+    @test ax.autolimitaspect[] === nothing
+end
+
 # issue 3240
 @testset "Axis limits 4-tuple" begin
     fig = Figure()
