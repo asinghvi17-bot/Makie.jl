@@ -28,27 +28,35 @@ ComputePipeline.StaticDispatch.install!(graph)
 module StaticDispatch
 
 using ..ComputePipeline: ComputePipeline, ComputeGraph, ComputeEdge, Input, Computed,
-    TypedEdge, AbstractEdge, GLOBAL_LOCK, hasparent, select, compute_identity
+    TypedEdge, AbstractEdge, SelectException, hasparent, select, compute_identity
 using Base: RefValue
-using Observables: Observable
+using Observables: Observables, Observable
 
 """
-    StaticDispatchError(kind::Symbol)
+    StaticDispatchError(kind::Symbol, name::Symbol, got, expected)
 
 Thrown by the methods added by [`install!`](@ref) when the graph reaches a state
 that did not exist when `install!` was called, e.g. an input set to a value of
-a new type or an edge that was never resolved.
+a new type or an edge that was never resolved. `name` is the input or node
+involved, `got` the type or types (a `Vector{Any}`) found and `expected` the types
+`install!` saw at that place (`nothing` if not applicable). The message is only formatted when shown.
 """
 struct StaticDispatchError <: Exception
     kind::Symbol
+    name::Symbol
+    got::Any
+    expected::Any
 end
+StaticDispatchError(kind::Symbol) = StaticDispatchError(kind, Symbol(""), nothing, nothing)
 
 function Base.showerror(io::IO, e::StaticDispatchError)
     print(io, "StaticDispatchError: ")
     msg = if e.kind === :untyped_edge
         "edge has no TypedEdge (it was not resolved before `install!`)"
     elseif e.kind === :typed_edge
-        "TypedEdge type or Any-typed node value type unknown at `install!`"
+        "TypedEdge type unknown at `install!`"
+    elseif e.kind === :typed_edge_values
+        "Any-typed input or output value types of this edge unknown at `install!`"
     elseif e.kind === :input
         "Input with callback, value or output type unknown at `install!`"
     elseif e.kind === :observable
@@ -61,6 +69,9 @@ function Base.showerror(io::IO, e::StaticDispatchError)
         string(e.kind)
     end
     print(io, msg)
+    isempty(string(e.name)) || print(io, "\n  at: ", e.name)
+    isnothing(e.got) || print(io, "\n  got: ", e.got)
+    isnothing(e.expected) || print(io, "\n  types seen by `install!`: ", e.expected)
     return
 end
 
@@ -79,6 +90,8 @@ struct Shapes
     # (callback type, value type, output RefValue type)
     input_calls::Set{Tuple{Type, Type, Type}}
     input_value_types::Set{Type}
+    # input name => value types (for error messages)
+    input_types_by_name::Dict{Symbol, Set{Type}}
     # abstractly typed RefValue type => value types
     abstract_refs::Dict{Type, Set{Type}}
     # (Observable type, RefValue type of the node)
@@ -89,8 +102,22 @@ struct Shapes
     skipped::Vector{Any}
 end
 
+# The concrete members of `T` if it is a small `Union` of concrete types, else `nothing`
+function union_members(@nospecialize(T))
+    T isa Union || return nothing
+    members = Base.uniontypes(T)
+    (length(members) <= MAX_UNION_MEMBERS && all(isconcretetype, members)) || return nothing
+    return members
+end
+const MAX_UNION_MEMBERS = 4
+
+# `nothing` for concretely typed slots, the slot's element type for small Unions of
+# concrete types (so values may switch between its members), else the type of the
+# value seen at `install!`
 function slot_type(ref::RefValue)
-    isconcretetype(eltype(ref)) && return nothing
+    T = eltype(ref)
+    isconcretetype(T) && return nothing
+    isnothing(union_members(T)) || return T
     return isassigned(ref) ? typeof(ref[]) : Any
 end
 
@@ -112,6 +139,19 @@ function find_graphs!(graphs::IdDict{ComputeGraph, Nothing}, graph::ComputeGraph
     end
     for input in values(graph.inputs), dep in input.dependents
         find_graphs!(graphs, ComputePipeline.parent_graph(dep))
+    end
+    # graphs fed by the same Observables (`add_input!(graph, key, ::Observable)`),
+    # including Observables of this graph's nodes (`get_observable!`)
+    for of in graph.observerfunctions
+        of.f isa ComputePipeline.ObservableInputUpdater && find_observable_graphs!(graphs, of.observable)
+    end
+    foreach(obs -> find_observable_graphs!(graphs, obs), values(graph.observables))
+    return graphs
+end
+
+function find_observable_graphs!(graphs::IdDict{ComputeGraph, Nothing}, obs)
+    for (_, listener) in Observables.listeners(obs)
+        listener isa ComputePipeline.ObservableInputUpdater && find_graphs!(graphs, listener.graph)
     end
     return graphs
 end
@@ -160,7 +200,7 @@ function prepare!(graphs; resolve::Bool = true)
                 end
             end
             if edge.resolved_once[] && !isassigned(edge.typed_edge)
-                @lock GLOBAL_LOCK edge.typed_edge[] = ComputePipeline.TypedEdge_no_call(edge)
+                @lock ComputePipeline.lock_for(graph) edge.typed_edge[] = ComputePipeline.TypedEdge_no_call(edge)
             end
             isassigned(edge.typed_edge) || (edge in skipped) || push!(skipped, edge)
         end
@@ -252,7 +292,7 @@ function collect_shapes(
 
     shapes = Shapes(
         graphs, ComputeEdge{ComputeGraph}[], Input{ComputeGraph}[],
-        Dict{Type, Set{Any}}(), Set{Tuple{Type, Type, Type}}(), Set{Type}(),
+        Dict{Type, Set{Any}}(), Set{Tuple{Type, Type, Type}}(), Set{Type}(), Dict{Symbol, Set{Type}}(),
         Dict{Type, Set{Type}}(), Set{Tuple{Type, Type}}(), Set{Tuple{Type, Type}}(),
         Any[typeof(e.callback) for e in skipped]
     )
@@ -262,6 +302,7 @@ function collect_shapes(
             push!(shapes.inputs, input)
             islive(input) || continue
             push!(shapes.input_value_types, typeof(input.value))
+            push!(get!(Set{Type}, shapes.input_types_by_name, input.name), typeof(input.value))
             if isdefined(input.output, :value)
                 push!(shapes.input_calls, (typeof(input.f), typeof(input.value), typeof(input.output.value)))
             end
@@ -320,7 +361,22 @@ function isa_chain(branches, fallback)
     return ex
 end
 
-fail(kind::Symbol) = :(throw($StaticDispatchError($(QuoteNode(kind)))))
+# `throw(StaticDispatchError(kind, name, got, expected))`. `name` and `got` are
+# expressions evaluated at runtime, `expected` is a value known at `install!`.
+# Lists of runtime types are built with `any_vector`: a tuple of them (also the
+# varargs tuple of `Any[a, b]`) would have an abstract type, which closed-world
+# compilers may not support (e.g. WasmCodegen).
+
+# `Vector{Any}` of the values of `exprs`, built with `push!`
+function any_vector(exprs)
+    v = gensym(:types)
+    return Expr(:let, :($v = $Any[]), Expr(:block, [:(push!($v, $x)) for x in exprs]..., v))
+end
+function fail(kind::Symbol, name = QuoteNode(Symbol("")), got = nothing, expected = nothing)
+    return :(throw($StaticDispatchError($(QuoteNode(kind)), $name, $got, $expected)))
+end
+
+slot_typeof(ref::RefValue) = isassigned(ref) ? typeof(ref[]) : Union{}
 
 # `ref[]::T` if the slot is Any-typed, else `ref[]`
 slot_value(ref, T) = T === nothing ? :($ref[]) : :($ref[]::$T)
@@ -342,7 +398,7 @@ function typed_edge_method(shapes::Shapes)
         IT, OT, F = T.parameters
         if F === typeof(compute_identity) || all(v -> all(isnothing, v[1]) && all(isnothing, v[2]), variants)
             # nothing Any-typed, the existing method is type stable
-            push!(branches, :(edge isa $T) => :(ComputePipeline.locked_resolve!(edge::$T)))
+            push!(branches, :(te isa $T) => :(ComputePipeline.locked_resolve!(te::$T)))
             continue
         end
         innames = fieldnames(IT)
@@ -365,22 +421,35 @@ function typed_edge_method(shapes::Shapes)
                 )
             )
         end
+        # value types of all slots for the error message
+        got = any_vector(
+            vcat(
+                [:($slot_typeof(e.inputs[$i])) for i in eachindex(innames)],
+                [:($slot_typeof(e.outputs[$i])) for i in 1:fieldcount(OT)],
+            )
+        )
+        expected = Tuple((v[1], v[2]) for v in variants)
         body = quote
-            e = edge::$T
+            e = te::$T
             any(e.inputs_dirty) || return
-            $(isa_chain(sub, fail(:typed_edge)))
+            $(isa_chain(sub, fail(:typed_edge_values, :(e.output_nodes[1].name), got, expected)))
         end
-        push!(branches, :(edge isa $T) => body)
+        push!(branches, :(te isa $T) => body)
     end
     return :(
-        function ComputePipeline.resolve_typed_edge!(@nospecialize(edge::TypedEdge))
-            $(isa_chain(branches, fail(:typed_edge)))
+        function ComputePipeline.resolve_edge_callback!(edge::ComputeEdge{ComputeGraph})
+            isassigned(edge.typed_edge) ||
+                $(fail(:untyped_edge, :(edge.outputs[1].name), :(typeof(edge.callback))))
+            te = edge.typed_edge[]
+            $(isa_chain(branches, fail(:typed_edge, :(edge.outputs[1].name), :(typeof(te)))))
             return
         end
     )
 end
 
 function input_method(shapes::Shapes)
+    # input name => value types seen, for error messages
+    expected = Dict{Symbol, Any}(k => Tuple(v) for (k, v) in shapes.input_types_by_name)
     branches = Any[]
     for (F, V, R) in shapes.input_calls
         cond = :(f isa $F && value isa $V && output.value isa $R)
@@ -392,8 +461,15 @@ function input_method(shapes::Shapes)
             f = input.f
             value = input.value
             output = input.output
-            isdefined(output, :value) || $(fail(:input))
-            $(isa_chain(branches, fail(:input)))
+            isdefined(output, :value) || $(fail(:input, :(input.name), any_vector([:(typeof(f)), :(typeof(value)), nothing])))
+            $(
+                isa_chain(
+                    branches, fail(
+                        :input, :(input.name), any_vector([:(typeof(f)), :(typeof(value)), :(typeof(output.value))]),
+                        :(get($expected, input.name, nothing))
+                    )
+                )
+            )
             return
         end
     )
@@ -418,7 +494,9 @@ function is_same_cached_methods(shapes::Shapes)
     methods = Any[]
     for (R, Vs) in shapes.abstract_refs
         branches = Any[]
-        for V in Vs
+        # all members of small Union slots, not just the ones seen at `install!`
+        members = union_members(eltype(R))
+        for V in (isnothing(members) ? Vs : members)
             isconcretetype(V) || continue
             push!(branches, :(old isa $V && new isa $V) => :(return ComputePipeline.is_same(old::$V, new::$V)))
         end
@@ -449,8 +527,13 @@ function select_method(shapes::Shapes)
     end
     return :(
         function ComputePipeline.forward_selected!(output::Computed, @nospecialize(choice::RefValue))
-            ComputePipeline.is_initialized(output) || $(fail(:select))
-            $(isa_chain(branches, fail(:select)))
+            ComputePipeline.is_initialized(output) || $(fail(:select, :(output.name)))
+            $(
+                isa_chain(
+                    branches,
+                    fail(:select, :(output.name), any_vector([:(typeof(output.value)), :(typeof(choice))]), Tuple(shapes.selections))
+                )
+            )
         end
     )
 end
@@ -467,7 +550,12 @@ function observable_method(shapes::Shapes)
     end
     return :(
         function ComputePipeline.sync_observable!(@nospecialize(obs::Observable), node::Computed, use_deepcopy::Bool)
-            $(isa_chain(branches, fail(:observable)))
+            $(
+                isa_chain(
+                    branches,
+                    fail(:observable, :(node.name), any_vector([:(typeof(obs)), :(typeof(node.value))]), Tuple(shapes.observables))
+                )
+            )
         end
     )
 end
@@ -483,17 +571,29 @@ function generate(shapes::Shapes)
     return Expr(
         :block,
         typed_edge_method(shapes),
-        :(ComputePipeline.resolve_untyped_edge!(edge::ComputeEdge{ComputeGraph}) = $(fail(:untyped_edge))),
         input_method(shapes),
         is_same_input_method(shapes),
         is_same_cached_methods(shapes)...,
         observable_method(shapes),
         select_method(shapes),
-        :(ComputePipeline.other_edge(f, @nospecialize(edge::AbstractEdge)) = $(fail(:other_edge))),
-        # ResolveException{typeof(e)} needs a dynamic constructor call
+        :(
+            ComputePipeline.other_edge(f, @nospecialize(edge::AbstractEdge)) =
+                $(fail(:other_edge, QuoteNode(Symbol("")), :(typeof(edge))))
+        ),
+        # `ResolveException{typeof(e)}` needs a dynamic constructor call. The
+        # exceptions ComputePipeline throws itself keep their concrete type, others
+        # are wrapped as `ResolveException{Exception}` (`showerror` is the same).
         :(
             function ComputePipeline.resolve_exception(computed::Computed, @nospecialize(e))
-                return e isa Exception ? ComputePipeline.ResolveException{Exception}(computed, e) : e
+                if e isa SelectException
+                    return ComputePipeline.ResolveException{SelectException}(computed, e)
+                elseif e isa StaticDispatchError
+                    return ComputePipeline.ResolveException{StaticDispatchError}(computed, e)
+                elseif e isa Exception
+                    return ComputePipeline.ResolveException{Exception}(computed, e)
+                else
+                    return e
+                end
             end
         ),
         nothing
@@ -501,7 +601,10 @@ function generate(shapes::Shapes)
 end
 generate(roots...; kwargs...) = generate(collect_shapes(roots...; kwargs...))
 
+# Methods added by `install!`. `install!`/`uninstall!` are meant to be called at
+# build time, but they take `INSTALL_LOCK` so concurrent calls can't interleave.
 const INSTALLED = Method[]
+const INSTALL_LOCK = ReentrantLock()
 
 """
     install!(roots...; inputs = nothing, outputs = nothing, prepare = true, resolve = true, mod = StaticDispatch)
@@ -513,26 +616,50 @@ See [`collect_shapes`](@ref) for `inputs` and `outputs` (restricting the
 generated code to edges between the inputs updated and the nodes read at
 runtime) and [`prepare!`](@ref).
 
+Graphs are connected through edges between them and through Observables they
+share as inputs (`add_input!(graph, key, ::Observable)`, also with Observables
+from `get_observable!`).
+
 Call this once, after all graphs are built and resolved, before compiling. The
 graphs keep working natively afterwards, but throw a [`StaticDispatchError`](@ref)
-for types or edges not seen by `install!`. Use [`uninstall!`](@ref) to return
-to the dynamic behaviour.
+for types or edges not seen by `install!`. Note that the added methods apply to
+every `ComputeGraph` in the session, including graphs not connected to `roots`.
+
+Modifying the graphs after `install!` is not supported: adding, removing or
+replacing inputs or edges (e.g. with `register_computation!`, `delete!` or an
+edge modification API) is not seen by the installed methods.
 """
 function install!(roots...; mod::Module = StaticDispatch, kwargs...)
-    isempty(INSTALLED) || error("StaticDispatch is already installed. Call `uninstall!()` first.")
-    shapes = collect_shapes(roots...; kwargs...)
-    ex = generate(shapes)
-    before = Set{Method}(installed_candidates())
-    Core.eval(mod, ex)
-    for m in installed_candidates()
-        m in before || push!(INSTALLED, m)
+    @lock INSTALL_LOCK begin
+        isempty(INSTALLED) || error("StaticDispatch is already installed. Call `uninstall!()` first.")
+        shapes = collect_shapes(roots...; kwargs...)
+        eval_tracked!(mod, generate(shapes).args)
+        return shapes
     end
-    return shapes
+end
+
+# Evaluates the method definitions `defs` in `mod` and records every method they add
+# in `INSTALLED`, also if one of them throws, so `uninstall!` can remove them.
+function eval_tracked!(mod::Module, defs)
+    @lock INSTALL_LOCK begin
+        for def in defs
+            (def isa Expr) || continue
+            before = Set{Method}(installed_candidates())
+            try
+                Core.eval(mod, def)
+            finally
+                for m in installed_candidates()
+                    m in before || push!(INSTALLED, m)
+                end
+            end
+        end
+    end
+    return
 end
 
 function installed_candidates()
     fs = (
-        ComputePipeline.resolve_typed_edge!, ComputePipeline.resolve_untyped_edge!,
+        ComputePipeline.resolve_edge_callback!,
         ComputePipeline.update_input_output!, ComputePipeline.is_same_input_value,
         ComputePipeline.is_same_cached, ComputePipeline.sync_observable!,
         ComputePipeline.other_edge, ComputePipeline.resolve_exception,
@@ -544,14 +671,18 @@ end
 """
     uninstall!()
 
-Removes the methods added by [`install!`](@ref).
+Removes the methods added by [`install!`](@ref), returning to the dynamic
+behaviour. Mainly meant for tests and interactive use; it relies on
+`Base.delete_method`, which is internal to Julia.
 """
 function uninstall!()
-    foreach(Base.delete_method, INSTALLED)
-    empty!(INSTALLED)
+    @lock INSTALL_LOCK begin
+        foreach(Base.delete_method, INSTALLED)
+        empty!(INSTALLED)
+    end
     return
 end
 
-isinstalled() = !isempty(INSTALLED)
+isinstalled() = @lock INSTALL_LOCK !isempty(INSTALLED)
 
 end
