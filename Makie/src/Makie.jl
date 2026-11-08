@@ -187,6 +187,7 @@ include("interaction/liftmacro.jl")
 include("colorsampler.jl")
 include("patterns.jl")
 include("utilities/utilities.jl") # need Makie.AbstractPattern
+include("utilities/earcut.jl")
 include("lighting.jl")
 # Basic scene/plot/recipe interfaces + types
 

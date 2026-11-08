@@ -113,14 +113,14 @@ function poly_convert(polygon::Polygon, transform_func = identity)
     # We sadly need to do this right now, since otherwise
     # The transformed points will mess with data_limits and the axes.
     # TODO, leave triangulations to the backend, and just pass the untransformed points
-    faces = GeometryBasics.earcut_triangulate(points)
+    faces = earcut_triangulate(points)
     return GeometryBasics.Mesh(points_flat, faces)
 end
 
 function poly_convert(polygon::AbstractVector{<:VecTypes{N, T}}, transform_func = identity) where {N, T}
     points2d = convert(Vector{Point2{float_type(T)}}, polygon)
     points_transformed = apply_transform(transform_func, points2d)
-    faces = GeometryBasics.earcut_triangulate([points_transformed])
+    faces = earcut_triangulate([points_transformed])
     # TODO, same as above!
     points = convert(Vector{Point{N, float_type(T)}}, polygon)
     return GeometryBasics.Mesh(points, faces)::GeometryBasics.SimpleMesh{N, float_type(T), GLTriangleFace}
