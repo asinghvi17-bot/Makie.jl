@@ -1,0 +1,5 @@
+(node:9581) ExperimentalWarning: WASI is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+imports: wasi_snapshot_preview1, julia_io, wasm_host
+host: {"inFlight":0,"maxInFlight":1,"textJobs":31,"glyphJobs":30,"ms":{"font":0.14757799999995314,"extent":3.2854930000000877,"glyph":1.312370000001522}}
+node Bjulia maxrss 295172 KB, 8.13 s

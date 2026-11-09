@@ -1,0 +1,277 @@
+From cb6fedb2072189ddb9fc607843d7a0fc8e15b7fe Mon Sep 17 00:00:00 2001
+From: Anshul Singhvi <anshulintheusa@gmail.com>
+Date: Mon, 9 Nov 2026 10:45:25 -0500
+Subject: [PATCH] js: text 'sdf' job: the finished SDF tile of a glyph,
+ computed in JS (EDT port of tiny-sdf, BSD-2 header kept)
+
+Request kind 'sdf' (codepoint, px, downsample, pad) answers with Makie's sdistancefield(bitmap, downsample, pad) tile as float32 plus the glyph's metrics,
+so a Wasm module need not run the distance transform. runTextRequest is exported (a page can answer recorded requests with it); stats.ms per job kind.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ js/common/LICENSE-tiny-sdf.txt |   9 +++
+ js/common/sdf.mjs              | 120 +++++++++++++++++++++++++++++++++
+ js/common/text.mjs             |  60 +++++++++++++----
+ 3 files changed, 175 insertions(+), 14 deletions(-)
+ create mode 100644 js/common/LICENSE-tiny-sdf.txt
+ create mode 100644 js/common/sdf.mjs
+
+diff --git a/js/common/LICENSE-tiny-sdf.txt b/js/common/LICENSE-tiny-sdf.txt
+new file mode 100644
+index 0000000..f061cfd
+--- /dev/null
++++ b/js/common/LICENSE-tiny-sdf.txt
+@@ -0,0 +1,9 @@
++BSD-2-Clause
++Copyright (c) 2016-2024 Mapbox, Inc.
++
++Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
++
++1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
++2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
++
++THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+diff --git a/js/common/sdf.mjs b/js/common/sdf.mjs
+new file mode 100644
+index 0000000..78e8d47
+--- /dev/null
++++ b/js/common/sdf.mjs
+@@ -0,0 +1,120 @@
++// A signed-distance-field tile for Makie's glyph atlas, computed in JS so that a module compiled by WasmCodegen does not
++// run the distance transform (about 0.7 s per glyph in the unoptimized wasm module, 34 ms natively; here a few ms).
++//
++// `edt` and `edt1d` are the squared-distance transform of @mapbox/tiny-sdf 2.3.0 (index.js), vendored under its license:
++//
++//   Copyright (c) 2016-2024 Mapbox, Inc.
++//   BSD-2-Clause. Redistribution and use in source and binary forms, with or without modification, are permitted provided
++//   that the following conditions are met: 1. Redistributions of source code must retain the above copyright notice, this
++//   list of conditions and the following disclaimer. 2. Redistributions in binary form must reproduce the above copyright
++//   notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with
++//   the distribution. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
++//   IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
++//   PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
++//   INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++//   SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
++//   OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
++//   OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++//   (the full text is in LICENSE-tiny-sdf.txt next to this file)
++//
++// The rest (`sdfTile`) is this repository's: it reproduces Makie's `sdistancefield(img, downsample, pad)`
++// (Makie/src/utilities/texture_atlas.jl) with the binary in/out classification Makie uses (coverage > 127.5, no
++// tiny-sdf alpha heuristics): the exact squared Euclidean distance from every pixel to the nearest inside pixel and
++// to the nearest outside pixel, sd = sqrt(outside) - sqrt(inside), averaged over downsample x downsample blocks and
++// divided by `downsample`.
++
++const INF = 1e20;
++
++// 2D Euclidean squared distance transform by Felzenszwalb & Huttenlocher https://cs.brown.edu/~pff/papers/dt-final.pdf
++function edt(data, x0, y0, width, height, gridSize, f, v, z, skipCols = 0) {
++  for (let x = x0 + skipCols; x < x0 + width - skipCols; x++) edt1d(data, y0 * gridSize + x, gridSize, height, f, v, z);
++  for (let y = y0; y < y0 + height; y++) edt1d(data, y * gridSize + x0, 1, width, f, v, z);
++}
++
++// 1D squared distance transform
++function edt1d(grid, offset, stride, length, f, v, z) {
++  v[0] = 0;
++  z[0] = -INF;
++  z[1] = INF;
++  f[0] = grid[offset];
++
++  for (let q = 1, k = 0; q < length; q++) {
++    const fq = f[q] = grid[offset + q * stride];
++    const q2 = q * q;
++    let s;
++    do {
++      const r = v[k];
++      s = (fq - f[r] + q2 - r * r) / (q - r) / 2;
++    } while (s <= z[k] && --k > -1);
++
++    k++;
++    v[k] = q;
++    z[k] = s;
++    z[k + 1] = INF;
++  }
++
++  for (let q = 0, k = 0; q < length; q++) {
++    while (z[k + 1] < q) k++;
++    const r = v[k];
++    const qr = q - r;
++    grid[offset + q * stride] = f[r] + qr * qr;
++  }
++}
++
++// Scratch space, reused between calls (a glyph tile is at most a few hundred pixels a side).
++let scratch = { n: 0, side: 0, outer: null, inner: null, f: null, v: null, z: null };
++function scratchFor(W, H) {
++  const n = W * H, side = Math.max(W, H);
++  if (scratch.n < n || scratch.side < side) {
++    scratch = { n, side, outer: new Float64Array(n), inner: new Float64Array(n), f: new Float64Array(side), v: new Uint16Array(side), z: new Float64Array(side + 1) };
++  }
++  return scratch;
++}
++
++/**
++ * Makie's `sdistancefield(img, downsample, pad)` for a coverage bitmap `bitmap` (row-major, `w` wide, `h` rows, top row
++ * first, 8-bit coverage). Returns `{tw, th, data}`: the tile is `tw` x `th` (x fastest: the memory order of a Julia
++ * `Matrix{Float32}(tw, th)`), `data` a Float32Array.
++ * `downsample` and `pad` are the atlas's (5 and 12): the padding is in tile pixels, `pad * downsample` bitmap pixels per side.
++ */
++export function sdfTile(bitmap, w, h, downsample, pad) {
++  const p = pad * downsample;
++  const W = Math.ceil((w + 2 * p) / downsample) * downsample;     // (Makie's `dividable_size`)
++  const H = Math.ceil((h + 2 * p) / downsample) * downsample;
++  const tw = W / downsample, th = H / downsample;
++  const { outer, inner, f, v, z } = scratchFor(W, H);
++  const n = W * H;
++
++  // outer: distance to the nearest inside pixel (0 on inside pixels); inner: to the nearest outside pixel (0 outside)
++  outer.fill(INF, 0, n);
++  inner.fill(0, 0, n);
++  let anyInside = false;
++  for (let y = 0; y < h; y++) {
++    let j = (y + p) * W + p;
++    for (let x = 0; x < w; x++, j++) {
++      if (bitmap[y * w + x] > 127.5) { outer[j] = 0; inner[j] = INF; anyInside = true; }
++    }
++  }
++
++  const out = new Float32Array(tw * th);
++  if (!anyInside) {
++    // (SignedDistanceFields.jl fills an image without inside pixels with its "upper bound" prod(size): a space becomes a tile of that value / downsample)
++    out.fill(n / downsample);
++    return { tw, th, data: out };
++  }
++  edt(outer, 0, 0, W, H, W, f, v, z);
++  edt(inner, 0, 0, W, H, W, f, v, z);
++
++  const div = downsample * downsample * downsample;   // (the block mean is /downsample^2, Makie then divides by downsample)
++  for (let ty = 0; ty < th; ty++) {
++    for (let tx = 0; tx < tw; tx++) {
++      let sum = 0;
++      for (let dy = 0; dy < downsample; dy++) {
++        let j = (ty * downsample + dy) * W + tx * downsample;
++        for (let dx = 0; dx < downsample; dx++, j++) sum += Math.sqrt(outer[j]) - Math.sqrt(inner[j]);
++      }
++      out[ty * tw + tx] = sum / div;
++    }
++  }
++  return { tw, th, data: out };
++}
+diff --git a/js/common/text.mjs b/js/common/text.mjs
+index d0dc89a..507781d 100644
+--- a/js/common/text.mjs
++++ b/js/common/text.mjs
+@@ -5,10 +5,12 @@
+ //
+ //   request  (UTF-8, one field per line):
+ //     "wasm-text 1"
+-//     "glyph" | "extent" | "font" | "measure"
++//     "glyph" | "extent" | "sdf" | "font" | "measure"
+ //     style  ("" | "bold" | "italic" | "italic bold"; the CSS font-style/weight words)
+ //     family (the CSS family name, as registered with the page's FontFace)
+ //     glyph/extent only:  codepoint (decimal), pixel size (decimal)
++//     sdf only:           codepoint, pixel size (the size the glyph is rasterized at: Makie's pix_per_glyph * downsample), downsample, pad
++//                         (Makie's atlas settings; pad in tile pixels)
+ //     measure only:       pixel size (decimal), then the string (\n and \\ escaped: one line)
+ //
+ //   response (binary, little-endian; all i32; "em6" = em fractions times 1e6, rounded):
+@@ -17,9 +19,14 @@
+ //             of coverage, row-major, top row first (FreeType's bitmap order: row 0 is the glyph's top), `left_px`/`top_px`
+ //             are FreeType's bitmap_left/bitmap_top (pixels from the origin to the bitmap's left edge / top edge, y up).
+ //     extent: the same without the bytes (w and h still tell the bitmap's size)
++//     sdf:    [1, status, tw, th, left_px, top_px, advance_em6, ink_left_em6, ink_top_em6, ink_w_em6, ink_h_em6] then tw*th little-endian
++//             float32: the finished tile of Makie's `sdistancefield(bitmap, downsample, pad)` (x fastest, i.e. a Julia Matrix{Float32}(tw, th)),
++//             computed here (common/sdf.mjs) from the glyph's bitmap; left/top/advance/ink are the glyph's, as in `glyph`
+ //     measure: [1, status, width in 1/1000 px]  (what `measureText` says of the string, kerning and ligatures included)
+ //     status 0 = ok, else a WASI errno; on a failure the rest is zeros and `errmsg` text follows the header.
+ 
++import { sdfTile } from './sdf.mjs';
++
+ export const PROTOCOL = 'wasm-text 1';
+ const enc = new TextEncoder();
+ 
+@@ -30,6 +37,7 @@ export function parseTextRequest(text) {
+   if (kind === 'font') return { kind, style: f[2], family: f[3] };
+   if (kind === 'measure') return { kind, style: f[2], family: f[3], px: Number(f[4]), text: f.slice(5).join('\n').replace(/\\(.)/g, (_, c) => (c === 'n' ? '\n' : c)) };
+   if (kind === 'glyph' || kind === 'extent') return { kind, style: f[2], family: f[3], cp: Number(f[4]), px: Number(f[5]) };
++  if (kind === 'sdf') return { kind, style: f[2], family: f[3], cp: Number(f[4]), px: Number(f[5]), downsample: Number(f[6]), pad: Number(f[7]) };
+   throw new Error(`wasm-text: request ${kind}`);
+ }
+ 
+@@ -55,6 +63,14 @@ export function formatGlyph(r, withBitmap) {
+   return out;
+ }
+ 
++export function formatSdf(r, tile) {
++  const out = new Uint8Array(11 * 4 + tile.data.byteLength); const dv = new DataView(out.buffer);
++  [1, 0, tile.tw, tile.th, r.left, r.top, em6(r.advance), em6(r.inkLeft), em6(r.inkTop), em6(r.inkW), em6(r.inkH)].forEach((v, i) => dv.setInt32(i * 4, v, true));
++  // (a Float32Array's bytes are the platform's: little-endian on every browser and Node target; written explicitly to be exact)
++  for (let i = 0; i < tile.data.length; i++) dv.setFloat32(44 + 4 * i, tile.data[i], true);
++  return out;
++}
++
+ export function formatError(errno, message) {
+   const m = enc.encode(String(message));
+   const out = new Uint8Array(11 * 4 + m.length); const dv = new DataView(out.buffer);
+@@ -63,6 +79,34 @@ export function formatError(errno, message) {
+   return out;
+ }
+ 
++// Runs one request text on `backend` and returns the response bytes (also what a page does to answer a recorded request).
++// stats.ms[kind]: the host's time in jobs of each kind, awaiting fonts and rasterizing included.
++export async function runTextRequest(backend, reqText, stats = {}) {
++  stats.textJobs ??= 0; stats.glyphJobs ??= 0;
++  const t0 = performance.now();
++  let kind = 'bad';
++  try {
++    const req = parseTextRequest(reqText);
++    kind = req.kind;
++    stats.textJobs++;
++    if (req.kind === 'font') return formatFont(await backend.font(req));
++    if (req.kind === 'measure') return formatMeasure(await backend.measure(req));
++    stats.glyphJobs++;
++    if (req.kind === 'sdf') {
++      const g = await backend.glyph(req);
++      const t1 = performance.now();
++      const tile = sdfTile(g.bitmap, g.w, g.h, req.downsample, req.pad);
++      stats.sdfMs = (stats.sdfMs ?? 0) + (performance.now() - t1); stats.sdfJobs = (stats.sdfJobs ?? 0) + 1;
++      return formatSdf(g, tile);
++    }
++    return formatGlyph(await backend.glyph(req), req.kind === 'glyph');
++  } catch (err) {
++    return formatError(5 /* EIO */, err?.message ?? err);
++  } finally {
++    stats.ms ??= {}; stats.ms[kind] = (stats.ms[kind] ?? 0) + (performance.now() - t0);
++  }
++}
++
+ // The adapter: `backend` has `async font({style, family}) -> {ascender, descender, height}` (em fractions) and
+ // `async glyph({style, family, cp, px}) -> {w, h, left, top, bitmap, advance, inkLeft, inkTop, inkW, inkH}`,
+ // `async measure({style, family, px, text}) -> width in px`.
+@@ -70,22 +114,10 @@ export function formatError(errno, message) {
+ export function makeTextImports({ jobs, memory, backend, check = () => {}, stats = {} }) {
+   stats.textJobs ??= 0; stats.glyphJobs ??= 0;
+   const text = (off, len) => new TextDecoder().decode(new Uint8Array(memory().buffer, off >>> 0, len));
+-  async function run(reqText) {
+-    try {
+-      const req = parseTextRequest(reqText);
+-      stats.textJobs++;
+-      if (req.kind === 'font') return formatFont(await backend.font(req));
+-      if (req.kind === 'measure') return formatMeasure(await backend.measure(req));
+-      stats.glyphJobs++;
+-      return formatGlyph(await backend.glyph(req), req.kind === 'glyph');
+-    } catch (err) {
+-      return formatError(5 /* EIO */, err?.message ?? err);
+-    }
+-  }
+   function text_start(reqOff, reqLen) {
+     check();
+     const reqText = text(reqOff, reqLen);
+-    return jobs.start(() => run(reqText));
++    return jobs.start(() => runTextRequest(backend, reqText, stats));
+   }
+   function text_finish(h, resOff, resCap) {
+     check();
+-- 
+2.53.0
+

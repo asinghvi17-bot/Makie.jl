@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Makie wasm capability map</title>
+<style>
+:root{
+  --bg:#ffffff;--fg:#1d1f23;--muted:#5d6370;--line:#d9dce1;--card:#f6f7f9;--code:#eef0f3;
+  --ok:#12733a;--okbg:#e3f5ea;--bad:#a8231c;--badbg:#fbe7e6;--part:#8a5a00;--partbg:#fdf1d8;
+  --unk:#4d5563;--unkbg:#eceef1;--link:#1f5fbf;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#15171a;--fg:#e4e6ea;--muted:#9aa1ad;--line:#33373e;--card:#1d2024;--code:#262a30;
+    --ok:#6fd49a;--okbg:#173322;--bad:#ff8f87;--badbg:#3a1a19;--part:#f2c46b;--partbg:#3a2e14;
+    --unk:#b9c0cc;--unkbg:#2a2e35;--link:#79a8ff;
+  }
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+main{max-width:1060px;margin:0 auto;padding:1.25rem 1rem 4rem}
+h1{font-size:1.65rem;line-height:1.25;margin:.4rem 0 .3rem}
+h2{font-size:1.3rem;margin:2.4rem 0 .6rem;padding-top:.6rem;border-top:1px solid var(--line)}
+h3{font-size:1.08rem;margin:1.5rem 0 .4rem}
+p,li{max-width:76ch}
+a{color:var(--link)}
+code,kbd{font:0.86em/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code);
+  padding:.08em .32em;border-radius:4px;overflow-wrap:anywhere}
+pre{background:var(--code);padding:.75rem;border-radius:6px;overflow-x:auto;font-size:.85rem}
+pre code{background:none;padding:0}
+.sub{color:var(--muted);margin-top:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:.8rem 1rem;margin:1rem 0}
+.tw{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:.8rem 0;border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:.9rem}
+th,td{padding:.45rem .55rem;border-bottom:1px solid var(--line);vertical-align:top;text-align:left}
+th{background:var(--card);position:sticky;top:0;font-weight:600}
+tr:last-child td{border-bottom:none}
+td.n{white-space:nowrap}
+.b{display:inline-block;font-size:.78rem;font-weight:600;padding:.05rem .45rem;border-radius:999px;white-space:nowrap}
+.ok{color:var(--ok);background:var(--okbg)}
+.bad{color:var(--bad);background:var(--badbg)}
+.part{color:var(--part);background:var(--partbg)}
+.unk{color:var(--unk);background:var(--unkbg)}
+.legend span{margin-right:.6rem}
+nav ol{columns:2;column-gap:2rem;padding-left:1.2rem}
+@media (max-width:640px){nav ol{columns:1} body{font-size:15px} th,td{padding:.4rem}}
+small,.small{font-size:.85rem;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+<h1>Makie 0.25 + WGLMakie compiled fully to WebAssembly: what works and what doesn't</h1>
+<p class="sub">WasmCodegen.jl main @316bbaf &middot; <code>verify=:error</code>, <code>host=:wasi</code>,
+<code>Config(shell_first_mutables=true)</code>, <code>trim=:safe</code> &middot; Julia 1.13.2 &middot; 2026-11-07</p>
+
+<div class="card">
+<strong>Short answer.</strong>
+<ul>
+<li><strong>Works now.</strong> These plots pass a strict compile when they are built at build time and only updated at runtime. Their WGLMakie update messages are byte-identical to native: scatter, lines, linesegments, image, heatmap, surface, volume, meshscatter, band, errorbars, and a user <code>@recipe</code>. <strong>text</strong> also works, with a prerendered atlas.</li>
+<li><strong>Fails in the update path:</strong> mesh, poly, barplot, hist, pie, contourf, arrows, contour, voxels, and the Axis block.</li>
+<li><strong>Fails for every type:</strong> creating plots at runtime (599 errors for <code>scatter!</code>) and deleting them (150 errors for <code>delete!</code>).</li>
+<li><strong>Interaction:</strong> cam2d has 6 errors. Every Julia-side interaction also needs a JS↔wasm bridge, which does not exist yet.</li>
+<li><strong>Most failures are type-stability problems that can be fixed upstream (class a).</strong> Only two failures were WasmCodegen gaps, and both have workarounds.</li>
+</ul>
+</div>
+
+<nav><ol>
+<li><a href="#setup">Setup and method</a></li>
+<li><a href="#matrix">Plot matrix (A / B / C / B′)</a></li>
+<li><a href="#text">Text and fonts</a></li>
+<li><a href="#static">Static path: typed plot constructors</a></li>
+<li><a href="#interact">Interaction</a></li>
+<li><a href="#blockers">Ranked blockers</a></li>
+<li><a href="#overrides">Overrides used</a></li>
+<li><a href="#mem">Memory</a></li>
+</ol></nav>
+
+<h2 id="setup">1. Setup and method</h2>
+<ul>
+<li><strong>Makie stack</strong> (local merges, not pushed): <code>trim/computepipeline-static-dispatch</code> @37cb4114 merged with <code>trim/axis-typed-access</code> @e2f01244. The latter already contained <code>fix/axis-025-native-bugs</code> @0adccd44.</li>
+<li><strong>Other packages:</strong> WasmCompat.jl <code>feat/observables-ext</code> @8df2164 and WasmHost.jl <code>feat/browser-adapter</code> @8b9340c. Bonito is v5.3.0.</li>
+<li><strong>Each probe</strong> is a small program in <code>deliverable/probes/p_*.jl</code>:
+  <ol>
+  <li>It builds a Scene or Figure at build time. Then it runs <code>WGLMakie.serialize_three</code> on every atomic plot, which registers WGLMakie's <code>wgl_renderobject</code> / <code>wgl_update_obs</code> nodes.</li>
+  <li>It attaches a recorder to each <code>wgl_update_obs</code>.</li>
+  <li>At runtime, <code>main()</code> sets plot inputs and polls <code>p[:wgl_renderobject][]</code>, as WGLMakie's <code>poll_all_plots</code> does. It prints a digest of every <code>Bonito.LargeUpdate</code>.</li>
+  </ol>
+  The same program runs natively (<code>native.jl</code>) and as wasm under node:wasi (<code>run.mjs</code>), and the two outputs are diffed (<code>probe.sh</code>).</li>
+<li><strong>Closed world.</strong> <code>ComputePipeline.StaticDispatch.install!</code> is limited to the probe's live inputs and outputs. <code>WasmCompatObservablesExt.close_world!</code> is called on the scene and the update observables (<code>common.jl</code>).</li>
+<li><strong>Argument types.</strong> Arguments are given already in their converted types (fixed point). This avoids <code>convert_arguments</code> recursing through <code>Any</code> (conversions.jl:13-26), which accounted for 392 errors in the first image probe.</li>
+<li><strong>Labels:</strong> <span class="b ok">PASS</span> = strict compile succeeded and the output is identical to native. <span class="b bad">FAIL n</span> = n verifier errors. <span class="b part">PASS*</span> = passes with build-time overrides of class (b). <span class="b unk">untested</span> = not probed; the reasoning given comes from reading the code.</li>
+<li><strong>Blocker classes:</strong> <strong>(a)</strong> upstream type fix; <strong>(b)</strong> build-time override or generator; <strong>(c)</strong> WasmCodegen gap; <strong>(d)</strong> fundamental to a closed world.</li>
+<li>All passing probes were re-run with the final override set as a regression sweep (<code>probes/out/summary.txt</code>, after the "FINAL SWEEP" marker).</li>
+</ul>
+
+<h2 id="matrix">2. Plot matrix</h2>
+<p class="legend small">
+<strong>A</strong>: plot built at build time, data and attributes updated at runtime.
+<strong>B</strong>: plot created at runtime.
+<strong>C</strong>: plot deleted at runtime.
+<strong>B′</strong>: for recipes, whether the number of children depends on the data.
+</p>
+<div class="tw"><table>
+<thead><tr><th>Plot</th><th>A (update)</th><th>B (create)</th><th>C (delete)</th><th>B′ (children)</th><th>Blocker (class)</th></tr></thead>
+<tbody>
+<tr><td>scatter</td><td><span class="b ok">PASS</span></td><td><span class="b bad">FAIL 599</span></td><td><span class="b bad">FAIL 150</span></td><td>atomic</td><td>
+<ul>
+<li>A: none. The module is 9.7 MB because it references the default 8 MiB Float16 atlas.</li>
+<li>B: generic plot construction (b/a).</li>
+<li>C: <code>free</code>, scenes.jl:584 (a), and the evaljs in display.jl:624 (b).</li>
+</ul></td></tr>
+<tr><td>lines</td><td><span class="b ok">PASS</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>atomic</td><td>B and C: same code path as scatter (<code>build_plot</code>, <code>insert_plot!</code>, <code>free</code>), so expected to fail in the same way.</td></tr>
+<tr><td>linesegments</td><td><span class="b ok">PASS</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>atomic</td><td>as lines</td></tr>
+<tr><td>mesh</td><td><span class="b bad">FAIL 59</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>atomic</td><td>conversions.jl:595-596: <code>GeometryBasics.expand_faceviews</code> and <code>mesh(...; normal=Union{Nothing,Vector})</code> (a)</td></tr>
+<tr><td>image</td><td><span class="b ok">PASS</span></td><td><span class="b bad">FAIL</span> (prior: 1336 → 215)</td><td><span class="b unk">untested</span></td><td>atomic</td><td>
+<ul>
+<li>A works with fixed-point arguments (<code>image_fixpoint</code>). With range arguments it fails with 502 errors (<code>image_scene</code>): 234 come from <code>get_step</code> at conversions.jl:415 (a).</li>
+<li>B: see task 055a3d4b.</li>
+</ul></td></tr>
+<tr><td>heatmap</td><td><span class="b ok">PASS</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>atomic</td><td>&mdash;</td></tr>
+<tr><td>surface</td><td><span class="b ok">PASS</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>atomic</td><td>Probed with vector x/y. <code>EndPoints</code> x/y throws a BoundsError natively too (Makie bug, not wasm).</td></tr>
+<tr><td>volume</td><td><span class="b ok">PASS</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>atomic</td><td>&mdash;</td></tr>
+<tr><td>meshscatter</td><td><span class="b ok">PASS</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>atomic</td><td>&mdash;</td></tr>
+<tr><td>text</td><td><span class="b part">PASS*</span> (FAIL 220 without overrides)</td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>Glyphs child is fixed. The <code>plotlist!</code> child for rich text and LaTeX specs varies with the data (text.jl:777).</td><td>FreeType, BezierPath and atlas rendering (texture_atlas.jl:4, :393; bezier.jl:222-224). Passes with the prerendered atlas (b); see <a href="#text">§3</a>.</td></tr>
+<tr><td>poly</td><td><span class="b bad">FAIL 54</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>fixed: mesh + lines</td><td>conversions.jl:595-596 (a)</td></tr>
+<tr><td>barplot</td><td><span class="b bad">FAIL 120</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>fixed at construction: poly, plus text if <code>bar_labels</code> was set (barplot.jl:475-483)</td><td>conversions.jl:609-617 (<code>merge</code> of meshes), :596; poly.jl:175-176 <code>to_lines</code> (a)</td></tr>
+<tr><td>band</td><td><span class="b ok">PASS</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>fixed: mesh + 2 lines (band.jl:101, 124)</td><td>&mdash;</td></tr>
+<tr><td>hist</td><td><span class="b bad">FAIL 78</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>fixed: barplot</td><td>conversions.jl:609-617; poly.jl:175-176 (a)</td></tr>
+<tr><td>contour</td><td><span class="b bad">FAIL 311</span>; 34 with the atlas</td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>fixed: lines + text (contours.jl:695, 735). Label glyph count varies, but that is data, not children.</td><td>Text as above. Then text.jl:155 <code>isscalar</code> over Any-typed label attributes (a).</td></tr>
+<tr><td>contourf</td><td><span class="b bad">FAIL 159</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>fixed: one poly (contourf.jl:252)</td><td>conversions.jl:609-617; <code>to_colormap</code> with named colormaps at conversions.jl:1679-1718 (ColorBrewer, :1697); poly.jl:176 (a)</td></tr>
+<tr><td>arrows (arrows2d)</td><td><span class="b bad">FAIL 158</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>fixed: poly (arrows.jl:564). arrows3d: 3 meshscatter (:862-874).</td><td>conversions.jl:596/617; poly.jl:176; arrows.jl:399; ComputePipeline.jl:1206 <code>is_same</code> (a)</td></tr>
+<tr><td>errorbars</td><td><span class="b ok">PASS</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>fixed: linesegments</td><td>&mdash;</td></tr>
+<tr><td>pie</td><td><span class="b bad">FAIL 60</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>fixed: poly (pie.jl:93)</td><td>conversions.jl:609-617 (a)</td></tr>
+<tr><td>voxels</td><td><span class="b bad">FAIL 40</span></td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>atomic</td><td>WasmCompatObservablesExt.jl:331 calls <code>isequal</code> on the ShaderAbstractions updater <code>Observable{Tuple{Function,Tuple}}</code> (a; ShaderAbstractions or the ext)</td></tr>
+<tr><td>user <code>@recipe</code></td><td><span class="b part">PASS*</span> (FAIL 243 without the atlas)</td><td><span class="b unk">untested</span></td><td><span class="b unk">untested</span></td><td>fixed in the probe (linesegments + scatter, built in <code>map!</code>). Varies only if the recipe uses <code>plotlist!</code>.</td><td>The scatter child's marker reaches BezierPath to atlas rendering (bezier.jl:222-224, texture_atlas.jl:393). Passes with the atlas overrides (b).</td></tr>
+<tr><td>Axis</td><td><span class="b bad">FAIL 439</span></td><td colspan="2"><span class="b unk">untested</span> (blocks are always created at build time in practice)</td><td>25 atomic plots natively. <code>reset_limits!</code> produces 14 updates.</td><td>Spread out: text 117 (text.jl:155, 240-241), ComputePipeline 109 (:682 <code>sync_observable_value!</code>, :1169, :2040), conversions 100 (:596, :1697), WasmCompat 20, axis.jl 19, makielayout/types.jl 16 (a)</td></tr>
+<tr><td>Axis3, Colorbar, Legend</td><td><span class="b unk">untested</span></td><td colspan="2"><span class="b unk">untested</span></td><td>&mdash;</td><td>Built from the same primitives: text, lines, poly/mesh, image or heatmap + <code>to_colormap</code>. Expected to hit at least the Axis blockers.</td></tr>
+</tbody></table></div>
+<p class="small">
+B′ from the source: the only 0.25 recipes whose number of children depends on the data use <code>plotlist!</code>: text specs (text.jl:777), series (series.jl:206), annotation (annotation.jl:367) and raincloud (raincloud.jl:359, 419). All other recipes listed create a fixed set of children in <code>plot!</code>, so a data change only changes child inputs. A varying child count is therefore runtime plot creation (B) and depends on the same work.
+</p>
+
+<h2 id="text">3. Text and fonts</h2>
+<h3>What fails</h3>
+<p>Without overrides, <code>text</code> fails with 220 errors. In order of appearance:</p>
+<ol>
+<li><strong>Atlas.</strong> The <code>TextureAtlas</code> struct and its deserialization of the cached atlas (texture_atlas.jl:4, 107-108), and rendering new glyphs at runtime: <code>render</code> → <code>renderface</code> → FreeType (texture_atlas.jl:376-407, :393).</li>
+<li><strong>BezierPath markers:</strong> bezier.jl:205-224, 809.</li>
+<li><strong>FreeType calls during layout.</strong> These are ccalls and loads of C structs. For each character, <code>layout_string</code> (text_layouting.jl:113-122) calls <code>find_font_for_char</code> (texture_atlas.jl:239), <code>FTA.glyph_index</code> and <code>get_extent</code>. <code>FTFont.getproperty</code> does an <code>unsafe_load</code> of <code>FT_FaceRec</code>.</li>
+<li><strong>Other paths:</strong>
+  <ul>
+  <li>the <code>_positions</code> callback (text.jl:68-85) uses <code>Core._typevar</code>, which is a WasmCodegen gap (c);</li>
+  <li>the <code>_placed_text_specs</code> <code>plotlist!</code> path deep-copies a <code>Vector{PlotSpec}</code> (ComputePipeline.jl:683);</li>
+  <li>WGLMakie's <code>glyph_data</code> is a <code>Dict{Symbol,Any}</code> compared with <code>is_same</code> (plot-primitives.jl:443).</li>
+  </ul></li>
+</ol>
+<p>In WGLMakie as shipped, the browser never rasterizes glyphs. WGLMakie's TextureAtlas.js (lines 60-106, 139-142) only receives SDF tiles that Julia rendered, so every new glyph must come from the wasm side, unless the host supplies it (routes B and B′ below).</p>
+
+<h3>Does a prerendered atlas work? Yes (probed: <code>p_text_atlas.jl</code>)</h3>
+<p><code>text_overrides.jl</code> works as follows:</p>
+<ol>
+<li>At build time, natively, it records for each font the face fields the layout reads, a <code>Char → glyph index</code> table, and the extent caches. It also renders every glyph of a chosen character set (here ASCII 32-126) into the atlas.</li>
+<li>It overlays, for Wasm only: <code>FTA.glyph_index</code>, <code>getproperty(::FTFont)</code>, <code>get_extent</code>, <code>find_font_for_char</code>, <code>get_texture_atlas</code> and <code>insert_glyph!</code>. The overlays are table lookups, and a miss raises a clean error.</li>
+<li>Two smaller overrides replace the <code>_positions</code> callback with typed predicates and stub the empty-spec <code>plotlist!</code>.</li>
+</ol>
+<p>Results:</p>
+<ul>
+<li>Strict compile passes.</li>
+<li>Runtime strings made of characters that were not in the build-time string but are in the prepared set give updates identical to native.</li>
+<li>Outside the set, <code>"Ω"</code> raises <code>character not in the build-time glyph set: Ω</code>, as designed.</li>
+<li>The only other diff: <code>glyph_data</code> is resent on every update because the <code>is_same</code> override always reports a change.</li>
+<li>Module size: 10.1 MB, 1.9 MB gzipped. Most of this is the 2048² Float16 atlas (8 MiB). An atlas with only the glyphs used would make it much smaller (estimate, not measured).</li>
+</ul>
+
+<h3>Seams in the 0.25 text pipeline for a pure-Julia stage</h3>
+<div class="tw"><table>
+<thead><tr><th>Stage</th><th>Seam (file:line)</th><th>What is needed</th></tr></thead>
+<tbody>
+<tr><td>Font type</td><td><code>const NativeFont = FreeTypeAbstraction.FTFont</code>, Makie.jl:152</td><td>Make it abstract, or a Union. Loosen the concrete fields at text.jl:120 (<code>glyph_fonts</code>), :296 (<code>TextAttributes.font</code>), :1185 and :1191 (<code>GlyphState</code>/<code>GlyphInfo</code>, typed <code>FTFont</code>), pathtext.jl:490 and text_layouting.jl:104. <code>FTFont</code> cannot be faked: it wraps a C face pointer.</td></tr>
+<tr><td>Layout</td><td><code>layout_text(text_handler, str, attributes)</code>, text.jl:547; <code>layout_string</code>, text_layouting.jl:100-190</td><td>Dispatch on <code>text_handler</code> is already a protocol. A pure-Julia handler needs advances and kerning from <code>hmtx</code>, plus <code>cmap</code>.</td></tr>
+<tr><td>Metrics</td><td><code>find_font_for_char</code> texture_atlas.jl:239-250; <code>FTA.get_extent</code> / <code>glyph_index</code></td><td>Methods for the new font type</td></tr>
+<tr><td>Rasterize</td><td><code>render(atlas, (glyph_index, font))</code> texture_atlas.jl:376-407</td><td>Outline to bitmap. The SDF step (<code>sdistancefield</code>, :331-353) is already pure Julia.</td></tr>
+<tr><td>Atlas</td><td><code>get_texture_atlas</code> :139, <code>load_texture_atlas</code> (cached file), <code>glyph_index!</code> :252 (keyed by <code>objectid(font)</code>)</td><td>A cache keyed by font name, so that it is stable across processes</td></tr>
+</tbody></table></div>
+
+<h3>FreeType compiled to wasm vs. a pure-Julia rasterizer</h3>
+<div class="tw"><table>
+<thead><tr><th></th><th>FreeType → wasm (like PCRE2_wasm_jll)</th><th>Pure-Julia parser + SDF</th></tr></thead>
+<tbody>
+<tr><td>Makie changes</td><td>None. FreeTypeAbstraction's ccalls become wasm imports of a linked library (<code>Config(import_libraries)</code>).</td><td><code>NativeFont</code> abstract and the field changes listed above</td></tr>
+<tr><td>Size (estimate, <span class="b unk">not measured</span>)</td><td>About 0.5-0.8 MB for libfreetype with the CFF and TrueType modules, plus the font file (TeX Gyre Heros Regular is 171 KB)</td><td>Tens of KB of wasm code, plus the font file. A subset font is smaller.</td></tr>
+<tr><td>Work</td><td>A BinaryBuilder wasm recipe. The pointer-heavy <code>FT_FaceRec</code> loads must line up with WasmCodegen's linear-memory ABI for imported libraries (<span class="b unk">untested</span>).</td><td>Parse cmap, hmtx and outlines. The bundled TeX Gyre fonts are <strong>CFF (OTTO)</strong>, checked from the table tags: <code>CFF, OS/2, cmap, head, hhea, hmtx, maxp, name, post</code>. That means a Type 2 charstring interpreter (cubic outlines) is required, not just <code>glyf</code>. Then scanline-fill to a bitmap and reuse <code>sdistancefield</code>.</td></tr>
+<tr><td>Coverage</td><td>Full fidelity: hinting, all font formats</td><td>Enough for SDF rendering (hinting is irrelevant at 64 px followed by SDF)</td></tr>
+</tbody></table></div>
+<h3>Letting the browser do the font work: routes B, B′, C and C′ (probed)</h3>
+<p>The question: can a JS solution give Julia the SDFs and the font metrics, and can a different text layouter emit a text type that needs no SDF at all because the browser draws the glyphs? Four routes were built and measured. (&ldquo;Route B/B′/C/C′&rdquo; here are not the A/B/C/B′ columns of §2.) The first two probes (B and C) are on branch <code>trim/text-browser</code> of asinghvi17-bot/makie.jl, the follow-ups (B′, C′) on top of it. Setup: the same Makie merge as in §1; WasmCodegen <code>feat/task-park-host-wait</code> @467d91e here (§1 used main @316bbaf), WasmCompat @8df2164, WasmHost @5cb54e3 plus the text jobs, <code>verify=:error</code>, <code>host=:wasi</code>, <code>trim=:safe</code>, <code>shell_first_mutables=true</code>, no wasm-opt (<code>optimize=nothing</code>); headless Chromium 158 and Node 26. Only Chromium was measured as a browser.</p>
+<div class="tw"><table>
+<thead><tr><th>Route</th><th>What the browser does</th><th>What Julia does</th><th>Cost per new glyph</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td><strong>Build-time atlas</strong> (above)</td><td>nothing</td><td>table lookups</td><td>none at run time; closed character set</td><td><span class="b part">works, fixed charset</span></td></tr>
+<tr><td><strong>B</strong>: browser rasterizes, Julia computes the SDF</td><td>Canvas2D <code>fillText</code> at 320 px, metrics from <code>measureText</code>; fonts loaded on first use</td><td>Makie's own <code>sdistancefield</code> and atlas packer, unchanged</td><td>about 740 ms in the compiled module (host: 0.6 ms); 34 ms natively</td><td><span class="b bad">too slow</span></td></tr>
+<tr><td><strong>B′</strong>: browser rasterizes and computes the SDF tile</td><td>the same, then an EDT in JS (tiny-sdf's Felzenszwalb&ndash;Huttenlocher transform), returning the finished tile at Makie's downsample and padding</td><td>reads the tile and inserts it into the atlas unchanged (no SDF code in the module)</td><td>8&ndash;11 ms end to end in Chromium (JS SDF 3&ndash;6 ms, raster 0.6 ms, the rest is the module's own work)</td><td><span class="b ok">works</span></td></tr>
+<tr><td><strong>C</strong>: no atlas; DOM or Canvas2D labels</td><td>draws and shapes the strings; <code>measureText</code> drives Makie's layout</td><td>a <code>text_handler</code> that returns browser metrics, then a label list (text, position, size, colour, angle)</td><td>none (no glyphs)</td><td><span class="b part">2D only</span></td></tr>
+<tr><td><strong>C′</strong>: C with a canvas-texture sprite per label inside the WebGL scene</td><td>draws each label to a canvas texture, which a quad samples with Makie's camera uniforms</td><td>the same label list</td><td>one texture per label</td><td><span class="b part">feasible, prototype works</span></td></tr>
+</tbody></table></div>
+
+<h3>Route B′: what was measured</h3>
+<p><strong>Interface.</strong> One host import pair, <code>wasm_host.text_start(req, len) &rarr; handle</code> and <code>text_finish(handle, buf, cap) &rarr; len</code>, with the same start/finish shape as WasmHost's <code>http_start</code>/<code>http_finish</code>. Request kinds: <code>font</code> (ascender, descender, line height), <code>extent</code> (advance and ink box), <code>sdf</code> (codepoint, pixel size, downsample, padding) and <code>measure</code>. An <code>sdf</code> response is Makie's <code>sdistancefield(bitmap, downsample, pad)</code> tile as little-endian float32 plus the glyph's metrics. The module parks on the handle (<code>Runtime.Host.await_handle</code>; JSPI in a browser) because loading a font face is asynchronous. A variant for fonts that are already loaded could be a plain synchronous import; it was not built. On the Julia side, the overlays are the ones from the first probe (<code>FTA.glyph_index</code> is the codepoint, <code>get_extent</code>, <code>getproperty(::FTFont)</code> and <code>find_font_for_char</code> from the host) and <code>insert_glyph!</code> takes the tile from the host. Makie is not modified.</p>
+<p><strong>SDF code.</strong> The JS side vendors <code>edt</code>/<code>edt1d</code> from <code>@mapbox/tiny-sdf</code> 2.3.0 (BSD-2-Clause, license header and file kept) and nothing else. Makie's SDF is the exact Euclidean distance to the nearest inside pixel minus the distance to the nearest outside pixel on a binary image (coverage above 127.5), averaged over 5&times;5 blocks and divided by 5. The F&ndash;H transform computes the same exact distances, so the JS tile has to be the same number, not an approximation.</p>
+<ul>
+<li><strong>SDF difference, same bitmap.</strong> FreeType's 320 px bitmaps of 115 glyphs (ASCII, Greek, accented letters, punctuation) through the JS code against Makie's own tile: all 115 tiles have the same size and the <strong>maximum and mean absolute difference are exactly 0</strong>, including the blank glyph (Makie fills a tile of a bitmap without inside pixels with <code>prod(size)/downsample</code>; the JS port reproduces that).</li>
+<li><strong>SDF difference, the browser's own raster</strong> (Canvas2D in Chromium 158 at 320 px, then the JS SDF, against Makie's tile for FreeType's bitmap of the same glyph): 103 of 115 tiles have the same size as Makie's; the other 12 differ by one tile pixel in one direction because the browser bitmap's bounding box differs by one pixel (<code>C G M O S w ( ; &lt; &gt; &bull; #</code>). On the 103: <strong>max |difference| 0.385, mean 0.021</strong> (median of the per-tile maxima 0.185; worst glyphs Q, 5, @, ?, &Omega;). The unit is a tile pixel (the 64 px em, where the shader's anti-aliased edge is about 1 unit wide). On the 93 glyphs whose bitmaps have identical size: max 0.24, mean 0.012. After the atlas's Float16 storage the numbers are the same to three digits.</li>
+<li><strong>Time per glyph.</strong> JS SDF step: 3.4 ms mean in Node 26 on FreeType bitmaps (best of 5; max 8.1 ms); in Chromium 3.2 ms best-of-5 and 3.7 ms on the first call in a standalone page, 5.4&ndash;5.8 ms per glyph inside the module runs; against 34.4 ms for Makie's Julia SDF natively and about 700 ms in the compiled module. The browser's raster costs 0.6 ms. Whole compiled module, Chromium: 15 new glyphs 0.41 s, 36 glyphs 0.55 s, 90 glyphs 0.97 s (slope 7.6 ms per glyph; about 4 ms of each glyph is the module's own work: two parked jobs, parsing, packing); route B on the 36-glyph text: 26.6 s (739 ms per glyph). Node with the mock backend, 15 glyphs: 0.52 s against 8.1 s, and the two atlases are byte-identical in their printed statistics.</li>
+<li><strong>Wasm size.</strong> Strict compile clean for both. Route B′ module 4,741,203 bytes (975,218 gzipped), route B 4,786,737 (997,213): <strong>&minus;45,534 bytes (&minus;0.95 %), &minus;21,995 bytes gzipped</strong> (the SDF code, SignedDistanceFields.jl, is gone). Unoptimized; with an empty atlas (no 8 MiB Float16 image), so both are well below the 10.1 MB of the prerendered-atlas module (not the same program). Build 255 s with 1.9 GB peak RSS (B: 304 s, 1.9 GB).</li>
+<li><strong>A <code>text!</code> scene, strictly compiled, run in Chromium.</strong> <code>text!</code> built at build time with &ldquo;hello&rdquo;, changed at run time to <code>Wasm: ünï 42 ΩΣ ≈ ∞</code> (glyphs the module never saw: <code>rc=0</code>, 31 host jobs, 15 new tiles). Layout numbers equal native FreeType: all 19 glyph origins and advances identical (largest difference 0.000 at 3 decimals, font size 40), block bounding box identical (389.4 &times; 46.6), font ascender/descender/height 947/&minus;218/1165 identical, ink boxes within 0.005 em.</li>
+<li><strong>Image difference to native.</strong> WGLMakie's own JS cannot display a Wasm module's output yet (no JS&harr;wasm session bridge, §6 #4), so the images come from the same Julia code run natively with the host's answers recorded from the real JS adapter in Chromium (<code>runTextRequest</code> + Canvas2D + <code>sdfTile</code>), displayed by WGLMakie in headless Chromium and compared with the same figure on FreeType. The text probe's printed output is identical between that run and the compiled module in Chromium, so the atlas and layout are the module's. Two native screenshots of one figure are bit-identical (noise floor 0). <em>Text scene</em> (7 text plots: four sizes, bold, italic, rotated, accents, Greek): mean |gray difference| 0.29 of 255 over 600&times;260 px, 24 pixels above 32 (max 66). <em>Axis</em> with title, two axis labels and tick labels (600&times;400, 35 glyphs): mean 0.042, 3 pixels above 32 (max 45). To the eye the images are the same; differences are sub-pixel edge placement.</li>
+<li><strong>An Axis with tick labels does not compile strictly, for reasons that are not text.</strong> Capmap's Axis probe with the host's text in place of the prerendered atlas fails with 437 verifier errors (439 with the atlas): none of the failing statements is in the new code, at FreeType or in the atlas; 117 originate in Makie's text.jl (<code>layout_text</code> over <code>input_text::Vector{Any}</code>, :547, :155, :566), the rest are the §6 items (ComputePipeline, conversions, colormaps, Observables). The Axis comparison above is therefore the hosted-native run, not a Wasm module.</li>
+</ul>
+<p><strong>Limits of B and B′.</strong> Glyphs are addressed by codepoint, so anything that addresses them by FreeType glyph id or glyph name cannot be drawn: MathTeXEngine (LaTeX), math variants. Makie's font fallback chain is replaced by the browser's: <code>document.fonts</code> cannot say whether a face has a codepoint, so there is no &ldquo;does this font have X&rdquo;, and fallback fonts differ per machine. A text plot built natively keeps FreeType glyph ids, so a native-built plot has to be re-set before its glyphs are looked up. Metrics are read at 4000 px (Chromium on Linux rounds advances to whole pixels at small sizes), the browser's raster is not FreeType's (IoU 0.995, bounding box identical for 93 of 115 glyphs), and the page has to register the fonts. A JSPI-capable browser is needed for the parking design (Firefox and Safari had none when WasmHost's docs were written); not measured outside Chromium.</p>
+
+<h3>Route C and C′: browser-drawn labels</h3>
+<ul>
+<li><strong>C</strong> (<code>text_handler</code> with <code>measureText</code> metrics, labels drawn by the DOM or Canvas2D over the canvas): strict compile clean, 2 host jobs, 0.5 s. A plain Axis matches native within sub-pixel shifts (mean |gray difference| 0.9&ndash;1.4 of 255; 0.34 for Canvas2D with <code>text-rendering: geometricPrecision</code>). It breaks 3D depth ordering (a label inside an opaque sphere is drawn over it), PNG export (<code>canvas.toDataURL</code> has no text), stroke/glow, per-glyph colours, and does not cover rich text or LaTeX. The Axis decorations need one blank glyph per line, because Axis sizes protrusions from per-glyph arrays.</li>
+<li><strong>C′ (canvas-texture sprite per label) keeps depth testing: yes.</strong> Each label is drawn with Canvas2D into a texture, and a quad is drawn by a <code>ShaderMaterial</code> that uses the 3D scene's own Makie camera uniforms (<code>scene.wgl_camera.projectionview</code>, <code>resolution</code>), anchored at the label's 3D point and sized in pixels. The label goes through the same depth buffer as the meshes, one depth per label (its anchor's), which is exactly what Makie's own <code>markerspace = :pixel</code> text does. Prototype: about 60 lines of JS added to the page, no change to Makie. In headless Chromium, in an <code>LScene</code> with an opaque sphere and three labels (inside the sphere, straddling the silhouette, above), the sprite scene reproduces native Makie text: the inside label is occluded, the straddling label is cut by the sphere, the label above is visible (mean |gray difference| 0.11 of 255, 357 pixels above 32 of 240,000, at glyph edges). After the camera is moved in the browser the labels follow with no Julia round trip, because the quad reads the camera uniform that OrbitControls updates. <code>canvas.toDataURL</code> contains the labels (bit-identical to the screenshot), unlike the DOM overlay. What still limits C′: the texture is rasterized at one pixel density (no re-rasterization on zoom or when a data-space label gets perspective-scaled), transparent sorting among several transparent objects is by object, not by label depth, labels are not in the picking pass, and clip planes and <code>overdraw</code> need handling in the shader. The layout, as in C, is the browser's and not Makie's, rich text and LaTeX still go through glyphs.</li>
+</ul>
+
+<div class="card"><strong>Recommendation (updated with the browser probes).</strong>
+<ul>
+<li><strong>Runtime text in a browser: route B′.</strong> It is the cheapest way to arbitrary text. About 230 lines of Julia overlays and a JS adapter of about 300 lines (including the SDF, of which about 40 lines are tiny-sdf's), Makie unchanged, layout metrics equal to FreeType's for the bundled font, tiles within 0.4 tile pixels of Makie's, 8&ndash;11 ms per new glyph, no prerendered 8 MiB atlas, and the module is smaller than with route B. It replaces the build-time atlas whenever the host is a browser that can park the module.</li>
+<li><strong>Keep the build-time atlas</strong> for hosts without a browser (Node, wasmtime) or where the character set is closed. It needs no host at run time.</li>
+<li><strong>The pure-Julia CFF/TrueType stage</strong> (the former &ldquo;Next&rdquo;) is needed only for what B′ cannot do: LaTeX and other glyph-id/name users, deterministic text outside a browser, or no JSPI. It is no longer the main path for plain text.</li>
+<li><strong>FreeType-to-wasm</strong> remains the fallback for full fidelity at run time everywhere.</li>
+<li><strong>Route C/C′ as an opt-in for plain 2D or simple 3D labels</strong> where browser-quality text matters more than matching Makie's layout; C′ (not the DOM) if the label must be depth tested or exported. Neither handles rich text or LaTeX.</li>
+<li>Whatever is chosen, the Axis is blocked by the §6 items, not by fonts.</li>
+</ul></div>
+
+<h2 id="static">4. Static path: typed plot constructors</h2>
+<h3>Do <code>@recipe</code> attribute declarations carry types?</h3>
+<p><strong>Syntactically yes, effectively no.</strong></p>
+<ul>
+<li><code>@recipe</code> accepts <code>attr::T = default</code>, but the type is only stored in runtime vectors (DocumentedAttributes.jl:358-550).</li>
+<li>For plots, every attribute becomes <code>Computed(key)</code> with <code>set_type!(node, Any)</code> unless the plot is primitive (DocumentedAttributes.jl:1220-1228). Only Blocks use the types (:1216-1218, <code>add_typed_nodes!</code>).</li>
+<li>Typed positional arguments (<code>@recipe Name (x::T, y::S)</code>) generate <code>types_for_plot_arguments</code> (recipes.jl:318-342, :339). These are used only for validation and docs (interfaces.jl:49, compute-plots.jl:823).</li>
+<li>The plot type alias is <code>const Name{ArgType} = Plot{name, ArgType}</code> (recipes.jl:451).</li>
+</ul>
+<h3>Where the types are lost (seams)</h3>
+<ul>
+<li><code>_create_plot</code> / <code>_create_plot!</code> (figureplotting.jl:441, 484, 547) and <code>default_plot_func</code> → <code>plottype(args...)</code> (:438).</li>
+<li><code>build_plot</code> (compute-plots.jl:916-932): <code>converted</code> is Any, <code>ArgTyp = typeof(converted)</code>, <code>FinalPlotFunc = plotfunc(plottype(P, converted...))</code>.</li>
+<li>Attribute conversion nodes are <code>AttributeConvert{Key,Plot}</code> built from runtime Symbols (compute-plots.jl:709-717, 900-964). Theme lookups use <code>Attributes</code> (Any).</li>
+<li><code>connect_plot!</code> (compute-plots.jl:936-981) → <code>plot!(plot)</code>, entered from <code>plot!(scene, plot)</code> (interfaces.jl:226-231).</li>
+<li><code>kw = Dict([k => v for (k, v) in user_kw if k in used_attr])</code> (compute-plots.jl:819).</li>
+<li>Edge-callback reflection: <code>Base.which(f, arg_types)</code> (ComputePipeline io.jl:85) — 130 of the 599 runtime-<code>scatter!</code> errors.</li>
+<li>WGLMakie insertion: <code>insert_plot!</code> → <code>Bonito.evaljs_value</code> (display.jl:500) — a synchronous round trip to JS.</li>
+</ul>
+<div class="card"><strong>Verdict: feasible, as a build-time generator.</strong> It works the same way as <code>StaticDispatch.install!</code> and <code>close_world!</code>, which already produce passing builds:
+<ol>
+<li>The app declares the call shapes it will make at runtime (plot function, argument types, attribute keys and types). The generator runs them natively once.</li>
+<li>It records the concrete <code>Plot{F,ArgTyp}</code>, the converted types, the resolved attribute and theme values, the edges created by <code>plot!</code>, and the children.</li>
+<li>It emits typed constructor methods as Wasm-only overlays, for example <code>static_plot!(parent, ::Val{:image}, x::T1, y::T2, img::T3, kw::NamedTuple{K,V})</code>. These build the graph with concrete <code>Computed</code> types and call the recorded edge callbacks directly.</li>
+</ol>
+Class (b) for the generator. The <code>Any</code>-widening it replaces is (a) and could be fixed upstream instead. Nothing found is (d), apart from types the build never saw (new user closures or recipe types at runtime).</div>
+<h3>Prototype plan: image + barplot</h3>
+<ol>
+<li><strong>image.</strong>
+  <ul>
+  <li>Record <code>build_plot(Image, scene, (x,y,img), kw)</code> natively. Emit a typed <code>build_plot</code>, <code>add_attributes!</code> with the recorded node types, and <code>connect_plot!</code>. The default argument conversion is already known to compile, from the fixed-point probe.</li>
+  <li>Run <code>StaticDispatch.install!</code> against the template plot's graph, so that later instances of the same type reuse the hooks.</li>
+  <li>Overlay <code>Base.which</code> at io.jl:85 to return the recorded location (b). Replace <code>argument_error</code> / <code>kw</code> Dict at compute-plots.jl:819 with the recorded key set.</li>
+  <li>For WGLMakie: replace <code>insert_plot!</code>'s <code>evaljs_value</code> (display.jl:500) with a host import that posts the serialized plot to the JS client. WasmHost's browser adapter has no Bonito comm bridge today.</li>
+  </ul></li>
+<li><strong>barplot.</strong> Do the same for <code>BarPlot</code> and its children (poly → mesh + lines, and optional text). First fix the mesh <code>merge</code> and <code>expand_faceviews</code> typing (conversions.jl:595-617, poly.jl:175-176), because barplot fails even in column A.</li>
+<li><strong>Size.</strong> Task 055a3d4b needed about 500 lines of hand overrides per plot type and still had 215 errors left. A generator should amortize that to about 1-1.5 k lines once, plus a declaration per call shape (estimate).</li>
+</ol>
+
+<h2 id="interact">5. Interaction</h2>
+<p>WGLMakie's JS client sends DOM events to Julia through a Bonito comm (<code>comm.notify</code>, WGLMakie.js:382-515). <code>connect_scene_events!</code> (events.jl:55-120) writes them into <code>events(scene)</code> observables inside <code>@async</code> (events.jl:58). Under wasm this requires:</p>
+<ol>
+<li>a host bridge that pushes JS events into an exported wasm entry. WasmHost <code>feat/browser-adapter</code> provides WASI + JSPI, not a Bonito comm;</li>
+<li>either <code>tasks=:jspi</code> or an override that drops the <code>@async</code>.</li>
+</ol>
+<p>Nothing in this table was run end to end in a browser.</p>
+<div class="tw"><table>
+<thead><tr><th>Capability</th><th>Status</th><th>Handled in JS?</th><th>Notes and blockers</th></tr></thead>
+<tbody>
+<tr><td>events (mouse, keyboard, scroll)</td><td><span class="b unk">untested e2e</span></td><td>Capture only</td><td>Julia round trip. Needs the bridge and <code>@async</code> handling described above. The Julia listeners compile when declared (see the on/lift/map! row).</td></tr>
+<tr><td>cam2d (pan, zoom)</td><td><span class="b bad">FAIL 6</span></td><td>No</td><td>
+<ul>
+<li>Errors: <code>ispressed(scene, cam.panbutton[])</code> etc. at camera2d.jl:134, 158, 176, 225, 255, where the button observables are typed as a wide Union; plus ComputePipeline nesting.jl:140 (a).</li>
+<li>Natively, a scroll zoom changes the camera area ([0.05,0.05]-[0.9,0.9]) and produces 0 plot updates: the camera is sent through camera-matrix observables (serialization.jl:272).</li>
+</ul></td></tr>
+<tr><td>Camera3D (LScene / <code>cam3d!</code>)</td><td><span class="b unk">untested</span></td><td><strong>Yes</strong></td><td>When <code>cameracontrols(scene) isa Camera3D</code>, WGLMakie serializes <code>cam3d_state</code> (serialization.jl:199-205) and JS attaches OrbitControls (Camera.js:43-90, Serialization.js:202). Rotation needs no Julia.</td></tr>
+<tr><td>Axis3 rotation</td><td><span class="b unk">untested</span></td><td>No</td><td>Julia-side Block interaction, so blocked by the Axis class (439) and the bridge</td></tr>
+<tr><td>Axis rectangle zoom, scroll zoom, drag pan</td><td><span class="b unk">untested</span></td><td>No</td><td>Julia interactions (makielayout). Blocked by Axis (439), <code>ispressed</code> as in cam2d, and the bridge.</td></tr>
+<tr><td>Axis limit reset</td><td><span class="b bad">FAIL</span> (with Axis)</td><td>No</td><td>Natively, <code>reset_limits!</code> produces 14 WGLMakie updates. Compiling it is part of the 439 errors.</td></tr>
+<tr><td>Linked axes</td><td><span class="b unk">untested</span></td><td>No</td><td>Julia observables between Axis blocks; same blockers as Axis</td></tr>
+<tr><td>Picking</td><td><span class="b unk">untested</span></td><td>Partly: JS picking buffer</td><td>Julia asks JS synchronously through <code>Bonito.evaljs_value</code> (picking.jl:8, 43, 61). Needs a synchronous host import, or JSPI with an async host call.</td></tr>
+<tr><td>DataInspector</td><td><span class="b unk">untested</span></td><td>No</td><td>Mouse listener → picking → tooltip text plot. Needs the bridge, picking and text (atlas).</td></tr>
+<tr><td>Slider, Button, Toggle, Menu, Textbox</td><td><span class="b unk">untested</span></td><td><strong>Yes with <code>use_html_widgets=true</code></strong></td><td>WGLMakie replaces these Blocks (and Checkbox) with HTML widgets (display.jl:162, html-widgets.jl:87, 218, 410, 512, 574, 649). The UI runs in the browser, and only value changes go to Julia through an <code>Observable{Any}</code> (html-widgets.jl:72-85). Without that flag they are Julia Blocks: Axis-class layout + text + events.</td></tr>
+<tr><td>IntervalSlider</td><td><span class="b unk">untested</span></td><td>No</td><td>No HTML replacement exists (<code>replace_widget!(::Any) = nothing</code>), so it is a Julia Block.</td></tr>
+<tr><td>Runtime <code>on</code> / <code>lift</code> / <code>map!</code></td><td><span class="b ok">works</span> if declared</td><td>&mdash;</td><td>
+<ul>
+<li>Listeners whose types are known at build time compile, including when added and removed at runtime (WasmCompat test/wasm/observables.jl P3, <code>register_listener!</code>).</li>
+<li>Undeclared listener types throw (expected diff in that test). This is (d) for arbitrary new closures.</li>
+<li>Compute-graph <code>map!</code> callbacks built at build time are proven by every A probe.</li>
+<li>New <code>map!</code> edges at runtime fall under B: StaticDispatch throws <code>StaticDispatchError</code> on unseen types.</li>
+</ul></td></tr>
+<tr><td>Animation loops and timers</td><td><span class="b unk">untested</span></td><td>&mdash;</td><td>
+<ul>
+<li>WGLMakie's tick clock is a <code>Makie.BudgetedTimer</code> (display.jl:68-73), a Julia Task/Timer. With <code>tasks=:none</code> (the default), waits that need another task throw (context.jl:85-88).</li>
+<li><code>tasks=:jspi</code> gives real Tasks, sleep and timers. It requires <code>host=:wasi</code> plus <code>host_extensions=[:julia_io]</code> (driver.jl:40-46) and a JSPI browser. It would help <code>@async</code> event dispatch and <code>record</code>/timer loops.</li>
+<li>The simpler path that is already proven: drive frames from JS <code>requestAnimationFrame</code>, calling an exported entry that sets inputs and polls. This is what the Tyler spike does.</li>
+</ul></td></tr>
+</tbody></table></div>
+
+<h2 id="blockers">6. Ranked blockers (deduplicated)</h2>
+<p class="small">Ranked by how many capabilities from §2 and §5 each one unblocks. Counts are verifier error sites from the probes (<code>probes/out/SITES.txt</code>).</p>
+<div class="tw"><table>
+<thead><tr><th>#</th><th>Blocker</th><th>Sites (file:line)</th><th>Unblocks</th><th>Class</th></tr></thead>
+<tbody>
+<tr><td class="n">1</td><td>Generic plot construction widens to Any</td><td>compute-plots.jl:916-932 (<code>build_plot</code>), :936-981 (<code>connect_plot!</code>), :819; figureplotting.jl:438-547; ComputePipeline io.jl:85 (<code>Base.which</code>, 130), ComputePipeline.jl:1974; transformation.jl:245; DocumentedAttributes.jl:1220-1228</td><td>B for every type, B′ for <code>plotlist!</code> recipes (rich/LaTeX text, series, annotation, raincloud), runtime <code>map!</code> edges, dynamic Legend entries</td><td>(b) generator, or (a)</td></tr>
+<tr><td class="n">2</td><td>Mesh conversion typing</td><td>conversions.jl:595-596 (<code>expand_faceviews</code>, <code>normal</code> Union), :609-617 (<code>merge</code>); poly.jl:175-176 <code>to_lines</code></td><td>mesh, poly, barplot, hist, pie, arrows, contourf; 42 Axis sites</td><td>(a)</td></tr>
+<tr><td class="n">3</td><td>Text and fonts through FreeType</td><td>Makie.jl:152; texture_atlas.jl:4, 239, 376-407; text_layouting.jl:113-122; bezier.jl:205-224; text.jl:155 (Any label attributes), :240-241</td><td>text (already PASS* via atlas), contour labels, Axis ticks and labels, Colorbar, Legend, Julia-side widgets, DataInspector, barplot labels, BezierPath markers in recipes</td><td>(b) now; (a) with a pure-Julia stage</td></tr>
+<tr><td class="n">4</td><td>No JS↔wasm session bridge (Bonito comm and evaljs)</td><td>WGLMakie display.jl:500 (<code>insert_plot!</code>), :624 (<code>delete!</code>); picking.jl:8, 43, 61; events.jl:55-58 (<code>@async</code>)</td><td>Inserting created plots into the JS scene (B), deletion (C), picking, DataInspector, every Julia-side interaction</td><td>(b): host imports or adapter design</td></tr>
+<tr><td class="n">5</td><td>Named colormaps go through an untyped path</td><td>conversions.jl:1679-1718 (:1697 <code>ColorBrewer.palette</code>)</td><td>contourf, Axis (47 sites), Colorbar (expected), image with range arguments (41)</td><td>(a), or resolve at build time (b)</td></tr>
+<tr><td class="n">6</td><td>Residual ComputePipeline instability</td><td>ComputePipeline.jl:682 (<code>sync_observable_value!</code>), :1169 (<code>set_result!</code>), :1186 (<code>is_same_cached</code>), :1206 (<code>is_same</code>), :2040</td><td>Axis, contour, arrows, voxels (partly)</td><td>(a)</td></tr>
+<tr><td class="n">7</td><td><code>free</code> recursion over <code>Vector{Plot}</code></td><td>scenes.jl:581-587 (100 at :584); attributes.jl:33</td><td>C for every type</td><td>(a)</td></tr>
+<tr><td class="n">8</td><td><code>ispressed</code> on Union-typed button observables</td><td>camera2d.jl:134, 158, 176, 225, 255; ComputePipeline nesting.jl:140</td><td>cam2d, and likely the Axis interactions</td><td>(a)</td></tr>
+<tr><td class="n">9</td><td>Argument conversion recursion through Any</td><td>conversions.jl:13-26; :405-435 (<code>get_step</code>, 234 in <code>image_scene</code>)</td><td>A with non-fixed-point argument types (ranges, intervals)</td><td>(a); worked around by fixed-point arguments</td></tr>
+<tr><td class="n">10</td><td>ShaderAbstractions updater observable</td><td>WasmCompatObservablesExt.jl:331 (<code>isequal</code> over <code>Observable{Tuple{Function,Tuple}}</code>)</td><td>voxels</td><td>(a)</td></tr>
+<tr><td class="n">11</td><td>WasmCodegen gaps (both worked around)</td><td><code>memoryrefnew of MemoryRef</code> (getindex on an abstract <code>Vector</code>, reached through compute-plots.jl:70); builtin <code>Core._typevar</code> (text.jl:68-85); <code>Tuple{Any}</code> construction in <code>set_result!</code></td><td>Removes the need for overrides 3, 4 and the text <code>_positions</code> override</td><td>(c)</td></tr>
+</tbody></table></div>
+
+<h2 id="overrides">7. Overrides used (all Wasm-only overlays; <code>probes/overrides.jl</code>)</h2>
+<p>All seven are class (a) and could be upstreamed. They are needed for every PASS above.</p>
+<ol>
+<li><strong>WGLMakie plot-primitives.jl:99, <code>plot_updates</code>:</strong> loop over the changed NamedTuple, unrolled with <code>@generated</code>.</li>
+<li><strong>plot-primitives.jl:87, <code>update_values!(updater, ::LargeUpdate)</code>:</strong> typed data.</li>
+<li><strong>compute-plots.jl:70, <code>getproperty(::Plot, key)</code>:</strong> with <code>hasfield</code>. This avoids a <code>Vector{Plot}</code> ∪ <code>Vector{ObserverFunction}</code> join, which hits gap (c).</li>
+<li><strong>ComputePipeline.jl:1150-1184, <code>set_result!</code>:</strong> unrolled per output.</li>
+<li><strong>ComputePipeline.jl:1217-1223, <code>locked_resolve!</code>:</strong> for edges with 32 or more inputs, because Base's tuple <code>map</code> only unrolls up to 31.</li>
+<li><strong>ComputePipeline utils.jl:7, <code>ExplicitUpdate</code>:</strong> the error message interpolates the undefined variable <code>should_update</code>. This is a real bug.</li>
+<li><strong>ComputePipeline.jl:535/1456, <code>resolve!(::Input)</code>:</strong> the UnionAll method instance bypasses StaticDispatch's <code>Input{ComputeGraph}</code> method.</li>
+</ol>
+<p>The text probes add the class (b) atlas and font-table overlays in <code>probes/text_overrides.jl</code>.</p>
+
+<h2 id="mem">8. Memory</h2>
+<ul>
+<li>Peak RSS of the largest strict compile: <strong>A_axis, 2,067,192 KB (≈1.97 GiB)</strong>, from <code>/usr/bin/time -f %M</code>. The next largest were A_contour (2,038,612 KB) and B_scatter (1,989,412 KB).</li>
+<li>Largest successful compile: text_atlas, 1,855,888 KB.</li>
+<li>All compiles ran one at a time, well under the 12 GiB budget. The passing probes take 105-181 s each.</li>
+</ul>
+<p class="small">Raw outputs: <code>deliverable/probes/out/</code> (<code>*.native.txt</code>, <code>*.wasm.txt</code>, <code>*.diff</code>, <code>*.build.txt</code>, <code>*.wasm.errors.txt[.gz]</code>, <code>summary.txt</code>, <code>SITES.txt</code>). Reproduce with <code>probes/probe.sh NAME</code>.</p>
+</main>
+</body>
+</html>

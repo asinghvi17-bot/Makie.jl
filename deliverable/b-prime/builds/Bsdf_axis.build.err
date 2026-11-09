@@ -1,0 +1,36 @@
+WARNING: Method definition (::Makie.var"#add_text_specs!##0#add_text_specs!##1"{Makie.Transformation})(Array{Makie.PlotSpec, 1}, Any...) in module TextCommon at /home/factory/.factory/profiles/personal/tmp/89f6bd12-ac24-4759-989e-a06715a1e717.tmp/work/text_common.jl:20 overwritten on the same line.
+WARNING: Method definition var"#register_arguments!##0"(Any, Any, Any) in module TextCommon at /home/factory/.factory/profiles/personal/tmp/89f6bd12-ac24-4759-989e-a06715a1e717.tmp/work/text_common.jl:61 overwritten on the same line.
+WARNING: Method definition (::Makie.var"#add_text_specs!##0#add_text_specs!##1"{Makie.Transformation})(Array{Makie.PlotSpec, 1}, Any...) in module TextCommon at /home/factory/.factory/profiles/personal/tmp/89f6bd12-ac24-4759-989e-a06715a1e717.tmp/work/text_common.jl:20 overwritten on the same line.
+WARNING: Method definition var"#register_arguments!##0"(Any, Any, Any) in module TextCommon at /home/factory/.factory/profiles/personal/tmp/89f6bd12-ac24-4759-989e-a06715a1e717.tmp/work/text_common.jl:61 overwritten on the same line.
+WARNING: Method definition (::Makie.var"#add_text_specs!##0#add_text_specs!##1"{Makie.Transformation})(Array{Makie.PlotSpec, 1}, Any...) in module TextCommon at /home/factory/.factory/profiles/personal/tmp/89f6bd12-ac24-4759-989e-a06715a1e717.tmp/work/text_common.jl:20 overwritten on the same line.
+WARNING: Method definition var"#register_arguments!##0"(Any, Any, Any) in module TextCommon at /home/factory/.factory/profiles/personal/tmp/89f6bd12-ac24-4759-989e-a06715a1e717.tmp/work/text_common.jl:61 overwritten on the same line.
+WARNING: Method definition (::Makie.var"#add_text_specs!##0#add_text_specs!##1"{Makie.Transformation})(Array{Makie.PlotSpec, 1}, Any...) in module TextCommon at /home/factory/.factory/profiles/personal/tmp/89f6bd12-ac24-4759-989e-a06715a1e717.tmp/work/text_common.jl:20 overwritten on the same line.
+WARNING: Method definition var"#register_arguments!##0"(Any, Any, Any) in module TextCommon at /home/factory/.factory/profiles/personal/tmp/89f6bd12-ac24-4759-989e-a06715a1e717.tmp/work/text_common.jl:61 overwritten on the same line.
+WARNING: Method definition (::Makie.var"#add_text_specs!##0#add_text_specs!##1"{Makie.Transformation})(Array{Makie.PlotSpec, 1}, Any...) in module TextCommon at /home/factory/.factory/profiles/personal/tmp/89f6bd12-ac24-4759-989e-a06715a1e717.tmp/work/text_common.jl:20 overwritten on the same line.
+WARNING: Method definition var"#register_arguments!##0"(Any, Any, Any) in module TextCommon at /home/factory/.factory/profiles/personal/tmp/89f6bd12-ac24-4759-989e-a06715a1e717.tmp/work/text_common.jl:61 overwritten on the same line.
+WARNING: Detected access to binding `Overrides.set_result_unrolled!` in a world prior to its definition world.
+  Julia 1.12 has introduced more strict world age semantics for global bindings.
+  !!! This code may malfunction under Revise.
+  !!! This code will error in future versions of Julia.
+Hint: Add an appropriate `invokelatest` around the access to this binding.
+To make this warning an error, and hence obtain a stack trace, use `julia --depwarn=error`.
+WARNING: Detected access to binding `Prog.main_` in a world prior to its definition world.
+  Julia 1.12 has introduced more strict world age semantics for global bindings.
+  !!! This code may malfunction under Revise.
+  !!! This code will error in future versions of Julia.
+Hint: Add an appropriate `invokelatest` around the access to this binding.
+To make this warning an error, and hence obtain a stack trace, use `julia --depwarn=error`.
+WARNING: Detected access to binding `Common.guard` in a world prior to its definition world.
+  Julia 1.12 has introduced more strict world age semantics for global bindings.
+  !!! This code may malfunction under Revise.
+  !!! This code will error in future versions of Julia.
+Hint: Add an appropriate `invokelatest` around the access to this binding.
+To make this warning an error, and hence obtain a stack trace, use `julia --depwarn=error`.
+WARNING: Detected access to binding `Prog.main` in a world prior to its definition world.
+  Julia 1.12 has introduced more strict world age semantics for global bindings.
+  !!! This code may malfunction under Revise.
+  !!! This code will error in future versions of Julia.
+Hint: Add an appropriate `invokelatest` around the access to this binding.
+To make this warning an error, and hence obtain a stack trace, use `julia --depwarn=error`.
+Command exited with non-zero status 2
+BUILD Bsdf_axis maxrss 2319756 KB, 147.97 s

@@ -1,0 +1,2 @@
+COMPILE FAILED after 92.6 s
+error type: WasmCodegen.TrimFailure; 437 verifier errors; 0 warnings; size 5628371

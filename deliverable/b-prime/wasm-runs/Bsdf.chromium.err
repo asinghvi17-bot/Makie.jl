@@ -1,0 +1,2 @@
+rc=0 405 ms {"inFlight":0,"maxInFlight":1,"textJobs":31,"glyphJobs":30,"ms":{"font":9.700000047683716,"extent":16.199999809265137,"sdf":75.299999833107},"sdfMs":73.79999995231628,"sdfJobs":15} Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.8127.18 Safari/537.36
+chromium Bsdf maxrss 122644 KB, 1.91 s
