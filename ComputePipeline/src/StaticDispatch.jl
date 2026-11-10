@@ -743,12 +743,15 @@ function generate(shapes::Shapes)
             ComputePipeline.other_edge(f, @nospecialize(edge::AbstractEdge)) =
                 $(fail(:other_edge, QuoteNode(Symbol("")), :(typeof(edge))))
         ),
-        # `ResolveException{typeof(e)}` needs a dynamic constructor call. The
-        # exceptions ComputePipeline throws itself keep their concrete type, others
-        # are wrapped as `ResolveException{Exception}` (`showerror` is the same).
+        # `ResolveException{typeof(e)}` needs a dynamic constructor call. An existing
+        # `ResolveException` (from a nested resolve) is passed on, as it is natively.
+        # The exceptions ComputePipeline throws itself keep their concrete type,
+        # others are wrapped as `ResolveException{Exception}` (`showerror` is the same).
         :(
             function ComputePipeline.resolve_exception(computed::Computed, @nospecialize(e))
-                if e isa SelectException
+                if e isa ComputePipeline.ResolveException
+                    return e
+                elseif e isa SelectException
                     return ComputePipeline.ResolveException{SelectException}(computed, e)
                 elseif e isa StaticDispatchError
                     return ComputePipeline.ResolveException{StaticDispatchError}(computed, e)

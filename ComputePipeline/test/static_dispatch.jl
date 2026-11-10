@@ -594,6 +594,53 @@ end
     @test sprint(showerror, wide) == sprint(showerror, native)
 end
 
+@testset "install! passes on an existing ResolveException" begin
+    # a callback which reads a failing node of another graph: the nested resolve
+    # throws a `ResolveException` which the outer resolve must not wrap again
+    function nested_graphs()
+        inner = ComputeGraph()
+        add_input!(inner, :a, 1.0)
+        map!(inner, :a, :z) do a
+            a > 2 && error("inner failed")
+            return a
+        end
+        outer = ComputeGraph()
+        add_input!(outer, :b, 1.0)
+        map!(outer, :b, :out) do b
+            return b + inner.z[]
+        end
+        outer.out[]
+        outer.b = 2.0
+        outer.out[]
+        return inner, outer
+    end
+    function nested_error(inner, outer)
+        inner.a = 3.0
+        outer.b = 3.0
+        return catch_error(() -> outer.out[])
+    end
+
+    inner, outer = nested_graphs()
+    native = nested_error(inner, outer)
+    @test native isa ResolveException{ErrorException}
+    @test native.start === inner.z
+
+    inner, outer = nested_graphs()
+    try
+        StaticDispatch.install!(outer, inner)
+        err = @invokelatest nested_error(inner, outer)
+        @test err isa ResolveException
+        @test !(err.error isa ResolveException)
+        @test err.error isa ErrorException
+        @test err.start === inner.z
+        @test @invokelatest(sprint(showerror, err)) == sprint(showerror, native)
+        existing = ResolveException(outer.out, ErrorException("x"))
+        @test @invokelatest(ComputePipeline.resolve_exception(inner.z, existing)) === existing
+    finally
+        StaticDispatch.uninstall!()
+    end
+end
+
 @testset "StaticDispatchError messages" begin
     graph = ComputeGraph()
     add_input!(graph, :a, 1.0)
