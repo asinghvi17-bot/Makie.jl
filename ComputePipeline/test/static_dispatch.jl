@@ -667,7 +667,7 @@ end
 @testset "install! with an Any-typed Observable" begin
     # the in-place update keeps the node dirty while the value stays equal, so
     # whether the Observable notifies depends on `is_same(obs[], value)`
-    function any_observable_graph()
+    function any_observable_graph(held = nothing)
         g = ComputeGraph()
         add_input!(g, :x, 1.0)
         register_computation!(g, [:x], [:y]) do inputs, changed, cached
@@ -677,6 +677,7 @@ end
         end
         ComputePipeline.set_type!(g.y, Any)
         obs = ComputePipeline.get_observable!(g, :y)
+        isnothing(held) || (obs.val = held) # a value of another type than the node's
         notified = Ref(0)
         on(_ -> notified[] += 1, obs)
         g.x = 1.5 # resolve once more, so the TypedEdge exists
@@ -720,6 +721,34 @@ end
         @test err isa StaticDispatchError && err.kind === :observable
     finally
         StaticDispatch.uninstall!()
+    end
+
+    @testset "install! with an Any-typed Observable holding another value type" begin
+        # `[1]` and `[1.0]` are the same for `is_same`, but the Observable holds a
+        # `Vector{Int}` while the node only ever has `Vector{Float64}`s
+        g, obs, notified = any_observable_graph([1])
+        @test obs[] isa Vector{Int}
+        reference = any_observable_updates!(g, obs, notified)
+        @test last.(reference) == [0, 1, 1, 2, 2] # equal values do not notify
+
+        g, obs, notified = any_observable_graph([1])
+        try
+            shapes = StaticDispatch.install!(g)
+            @test Vector{Int} in shapes.observable_held_types[typeof(obs)]
+            @test obs[] isa Vector{Int}
+            @test @invokelatest(any_observable_updates!(g, obs, notified)) == reference
+            sig = Tuple{Observable{Any}, Any}
+            dynamic, static = @invokelatest compiled_calls(ComputePipeline.is_same_observable, sig)
+            @test isdisjoint(first.(dynamic), [:is_same, :isequal])
+            # (inlined) comparison of the held `Vector{Int}` with the node's `Vector{Float64}`
+            @test any(c -> c == (:isa, Any[Any, Type{Vector{Int}}]), dynamic)
+            # a value type not seen at `install!` and not produced by the node is "not the same",
+            # like for the other `is_same` chains
+            obs.val = 1
+            @test !@invokelatest(ComputePipeline.is_same_observable(obs, [1.0]))
+        finally
+            StaticDispatch.uninstall!()
+        end
     end
 end
 

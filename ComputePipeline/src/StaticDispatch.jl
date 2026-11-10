@@ -101,6 +101,8 @@ struct Shapes
     abstract_refs::Dict{Type, Set{Type}}
     # (Observable type, RefValue type of the node)
     observables::Set{Tuple{Type, Type}}
+    # abstractly typed Observable type => types of the values the Observables hold
+    observable_held_types::Dict{Type, Set{Type}}
     # (output RefValue type, choice RefValue type) of select/ifelse edges
     selections::Set{Tuple{Type, Type}}
     # edges that could not be resolved / typed (callback types)
@@ -414,7 +416,7 @@ function shapes_of(graphs::Vector{ComputeGraph}, skipped, inputs, outputs)
     shapes = Shapes(
         graphs, ComputeEdge{ComputeGraph}[], Input{ComputeGraph}[],
         Dict{Type, Set{Any}}(), Set{Tuple{Type, Type, Type}}(), Set{Type}(), Dict{Symbol, Set{Type}}(),
-        Dict{Type, Set{Type}}(), Set{Tuple{Type, Type}}(), Set{Tuple{Type, Type}}(),
+        Dict{Type, Set{Type}}(), Set{Tuple{Type, Type}}(), Dict{Type, Set{Type}}(), Set{Tuple{Type, Type}}(),
         Any[typeof(e.callback) for e in skipped]
     )
 
@@ -459,6 +461,10 @@ function shapes_of(graphs::Vector{ComputeGraph}, skipped, inputs, outputs)
             isnothing(node) && continue
             hasparent(node) && !islive(node.parent) && continue
             isdefined(node, :value) && push!(shapes.observables, (typeof(obs), typeof(node.value)))
+            # an Observable{Any} may hold a value of any type, e.g. one set by the user
+            # before `install!`, which `is_same_observable` is called with as the old value
+            isconcretetype(observable_value_type(typeof(obs))) ||
+                push!(get!(Set{Type}, shapes.observable_held_types, typeof(obs)), typeof(obs[]))
         end
     end
     return shapes
@@ -625,12 +631,14 @@ end
 
 # `return is_same(old, new)` with static calls for every pair of the concrete `types`
 # for which `is_same` has a method (e.g. `Vector{Int}` and `Vector{Float64}`), and
-# `return false` for other values, like the fallback method of `is_same`
-function is_same_chain(old::Symbol, new::Symbol, types, name)
+# `return false` for other values, like the fallback method of `is_same`. The old
+# value may have other types (`old_types`) than the new one (`types`).
+function is_same_chain(old::Symbol, new::Symbol, types, name; old_types = types)
     types = filter(isconcretetype, collect(Type, types))
+    old_types = unique(filter(isconcretetype, collect(Type, old_types)))
     outer = Any[]
     pairs = 0
-    for A in types
+    for A in old_types
         inner = Any[]
         # same type first, it's the common case
         for B in sort(types; by = B -> B !== A)
@@ -756,20 +764,22 @@ function observable_method(shapes::Shapes)
 end
 
 # `is_same(obs[], new)` of the Observables with an abstract value type has to branch
-# on the type of the old value (the type of a node value the Observable was fed with)
+# on the type of the old value, i.e. the type of a node value the Observable was fed
+# with, or of the value it held at `install!` (the new value is always a node value)
 function is_same_observable_methods(shapes::Shapes)
-    old_types = Dict{Type, Vector{Type}}()
+    new_types = Dict{Type, Vector{Type}}()
     for (O, R) in shapes.observables
         isconcretetype(observable_value_type(O)) && continue
-        append!(get!(Vector{Type}, old_types, O), slot_value_types(shapes, R))
+        append!(get!(Vector{Type}, new_types, O), slot_value_types(shapes, R))
     end
     methods = Any[]
-    for (O, types) in old_types
+    for (O, types) in new_types
+        old_types = vcat(types, collect(Type, get(shapes.observable_held_types, O, Type[])))
         push!(
             methods, :(
                 function ComputePipeline.is_same_observable(obs::$O, @nospecialize(new))
                     old = obs[]
-                    $(is_same_chain(:old, :new, unique(types), "is_same_observable(::$O)"))
+                    $(is_same_chain(:old, :new, unique(types), "is_same_observable(::$O)"; old_types))
                 end
             )
         )
