@@ -1801,7 +1801,8 @@ const static_colormaps = StaticColormaps(something(static_colormap_names, String
         """
         The colormap `$cs` is not in Makie's static colormap tables, which hold $(length(table.colormaps)) colormaps.
         Programs compiled ahead of time (`juliac --trim`, WasmCodegen) can't look colormaps up in the ColorSchemes registry,
-        so Makie only includes the colormaps listed in its `static_colormaps` preference. To add this one, run
+        so Makie only includes the colormaps listed in its `static_colormaps` preference. To add this one to the ones already
+        listed, run
             using Makie; Makie.set_static_colormaps!("$cs")
         in the project you compile in and restart Julia so that Makie is recompiled (`Makie.set_static_colormaps!(all = true)`
         includes every colormap). If `$cs` is not a colormap, see `Makie.available_gradients()`.
@@ -1835,12 +1836,13 @@ function check_colormap_names(names)
 end
 
 """
-    set_static_colormaps!(names...; all = false)
-    set_static_colormaps!(names::AbstractVector; all = false)
+    set_static_colormaps!(names...; all = false, replace = false)
+    set_static_colormaps!(names::AbstractVector; all = false, replace = false)
 
 Choose the named colormaps (`:magma`, `"Set1"`, ...) that Makie includes when it is compiled ahead of time with `juliac --trim`
 or to WebAssembly with WasmCodegen. Call it once in the project that you compile in, before compiling, then restart Julia so
-that Makie recompiles. With `all = true`, every colormap is included (well over a megabyte in a WebAssembly module).
+that Makie recompiles. The names are added to the ones already chosen, unless `replace = true`. With `all = true`, every
+colormap is included (well over a megabyte in a WebAssembly module).
 
 By default, a named colormap is looked up in the ColorSchemes registry every time it is converted. That lookup can't be
 compiled ahead of time (it is dynamically dispatched), so with this preference set, `to_colormap(::Symbol)`, `Reverse(:name)`,
@@ -1857,23 +1859,37 @@ and can also be written there directly:
 static_colormaps = ["magma", "Set1"]   # or "all"
 ```
 
+Julia only applies a preference of Makie in a project that maps Makie's UUID, i.e. that has Makie in its `[deps]` or
+`[extras]`. A project that only depends on a backend (CairoMakie, WGLMakie, ...) ignores a hand-written `[Makie]` section.
+This function adds the `[extras]` entry for Makie to the project's `Project.toml` for you. The preference is read when Makie is
+precompiled; if Makie is part of a system image, the choice is baked into it, so changing it needs a new system image.
+
 `unset_static_colormaps!()` removes it again.
 """
-function set_static_colormaps!(names...; all::Bool = false)
+function set_static_colormaps!(names...; all::Bool = false, replace::Bool = false)
     names = String[string(n) for n in Iterators.flatten(n isa Union{AbstractString, Symbol} ? (n,) : n for n in names)]
     check_colormap_names(names)
-    Preferences.set_preferences!(@__MODULE__, "static_colormaps" => all ? "all" : names; force = true)
-    @info "Makie's static colormaps are set. Restart Julia so that Makie recompiles with them." names = all ? "all" : static_colormap_names_from(names)
+    existing = replace ? nothing : Preferences.load_preference(@__MODULE__, "static_colormaps", nothing)
+    value = if all || existing === true || existing == "all"
+        "all"
+    else
+        old = existing isa Union{AbstractString, Symbol} ? [string(existing)] : existing === nothing || existing === false ? String[] : String[string(n) for n in existing]
+        unique!(vcat(old, names))
+    end
+    Preferences.set_preferences!(@__MODULE__, "static_colormaps" => value; force = true)
+    @info "Makie's static colormaps are set. Restart Julia so that Makie recompiles with them." names = value == "all" ? "all" : static_colormap_names_from(value)
     return nothing
 end
 
 """
     unset_static_colormaps!()
 
-Remove the `static_colormaps` preference (see [`set_static_colormaps!`](@ref)): Makie looks named colormaps up in the registry again, after a restart.
+Remove the `static_colormaps` preference (see [`set_static_colormaps!`](@ref)): after a restart, Makie looks named colormaps up
+in the registry again. A `static_colormaps` preference in another environment of the load path or in an exported
+preference is ignored from then on, too.
 """
 function unset_static_colormaps!()
-    Preferences.delete_preferences!(@__MODULE__, "static_colormaps"; force = true)
+    Preferences.delete_preferences!(@__MODULE__, "static_colormaps"; block_inheritance = true, force = true)
     @info "Makie's static colormaps are removed. Restart Julia so that Makie recompiles without them."
     return nothing
 end

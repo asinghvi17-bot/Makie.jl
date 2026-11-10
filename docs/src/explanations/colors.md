@@ -236,6 +236,7 @@ Makie.set_static_colormaps!(:magma, :RdBu, "Set1") # the colormaps that the prog
 # Makie.set_static_colormaps!(all = true)          # or all of them
 ```
 
+Names are added to the ones already chosen (`Makie.set_static_colormaps!(...; replace = true)` replaces them), so you can call it again when the program needs another colormap.
 This writes to the `LocalPreferences.toml` of the active project, which you can also edit directly:
 
 ```toml
@@ -244,6 +245,13 @@ static_colormaps = ["magma", "RdBu", "Set1"]   # or "all"
 ```
 
 Then `heatmap(...; colormap = :magma)`, `colormap = Reverse(:RdBu)`, `colormap = (:magma, 0.5)` and `categorical_colors(:Set1, 5)` compile.
-A name that is not in the tables throws an error that names it and says how to add it.
-`Makie.unset_static_colormaps!()` removes the preference again.
+A name that is not in the tables throws an error that names it and shows the call that adds it.
+`Makie.unset_static_colormaps!()` removes the preference again, including one that the active project would otherwise inherit from another environment in the load path.
 When the preference is not set, which is the default, Makie looks names up in the registry as usual, and nothing about the tables costs anything.
+
+Two things to be aware of:
+
+- Julia only applies a preference of Makie in a project that maps Makie's UUID, which means that Makie is in its `[deps]` or `[extras]`.
+  A project that depends only on a backend such as CairoMakie or WGLMakie silently ignores a hand-written `[Makie]` section in its `LocalPreferences.toml`.
+  `Makie.set_static_colormaps!` adds the `[extras]` entry for Makie to the project's `Project.toml` for you, so prefer it over editing the file.
+- The preference is read when Makie is precompiled. If Makie is part of a system image, the choice is baked into the image, and changing the list needs a new system image.
