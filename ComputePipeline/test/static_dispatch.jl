@@ -183,7 +183,7 @@ end
         map!(a -> Ref{Union{Nothing, Float64}}(a < 0 ? nothing : round(a)), graph, :a, :u)
         map!(u -> (calls[] += 1; something(u, -1.0)), graph, :u, :down)
         graph.down[]
-        graph.a = -2.0
+        graph.a = -1.2
         graph.down[]
         return graph
     end
@@ -229,6 +229,113 @@ end
     finally
         StaticDispatch.uninstall!()
     end
+end
+
+@testset "install! finds the graph producing an Observable" begin
+    # g2 is fed by an Observable of a g1 node, install! starts from g2
+    g1 = ComputeGraph()
+    add_input!(g1, :x, 1.0)
+    map!(x -> 2x, g1, :x, :y)
+    g2 = ComputeGraph()
+    add_input!(g2, :y, ComputePipeline.get_observable!(g1, :y))
+    map!(y -> y + 1, g2, :y, :z)
+    # Observables cached under keys which are not nodes are ignored
+    g1.observables[:not_a_node] = Observable(1)
+    for v in (1.0, 2.0)
+        g1.x = v
+        g2.z[]
+    end
+    try
+        shapes = StaticDispatch.install!(g2)
+        @test length(shapes.graphs) == 2
+        @test any(g -> g === g1, shapes.graphs)
+        @invokelatest setproperty!(g1, :x, 3.0)
+        @test @invokelatest(g1.y[]) == 6.0
+        @test @invokelatest(g2.z[]) == 7.0
+    finally
+        StaticDispatch.uninstall!()
+    end
+end
+
+function cross_type_steps!(graph, calls)
+    out = Int[]
+    # :u is [1] (Int) at first. Equal, different type; different; equal, different type; same input
+    for a in (1.0, 2.0, -2.0, -2.0)
+        graph.a = a
+        graph.down[]
+        push!(out, calls[])
+    end
+    return out
+end
+
+@testset "install! keeps is_same for values of different types" begin
+    function build(calls)
+        graph = ComputeGraph()
+        add_input!(graph, :a, -1.0)
+        # equal values of different types are the same for `is_same`: [|a|], Int for a < 0
+        map!(graph, :a, :u) do a
+            return Ref{Union{Vector{Int}, Vector{Float64}}}(a < 0 ? [round(Int, -a)] : [round(a)])
+        end
+        map!(u -> (calls[] += 1; sum(u)), graph, :u, :down)
+        # inputs with values of different types
+        add_input!(graph, :v, [1, 2])
+        add_input!(graph, :w, [1.0])
+        map!(v -> (calls[] += 1; length(v)), graph, :v, :vlen)
+        graph.down[], graph.vlen[], graph.w[]
+        graph.a = -1.2
+        graph.down[]
+        return graph
+    end
+    function input_steps!(graph, calls)
+        out = Int[]
+        for v in ([1.0, 2.0], [1, 2], [1, 2, 3])
+            graph.v = v
+            graph.vlen[]
+            push!(out, calls[])
+        end
+        return out
+    end
+    calls = Ref(0)
+    graph = build(calls)
+    reference = (cross_type_steps!(graph, calls), input_steps!(graph, calls))
+    @test reference == ([2, 3, 3, 3], [3, 3, 4])
+
+    calls = Ref(0)
+    graph = build(calls)
+    try
+        StaticDispatch.install!(graph)
+        @test @invokelatest(cross_type_steps!(graph, calls)) == reference[1]
+        @test @invokelatest(input_steps!(graph, calls)) == reference[2]
+    finally
+        StaticDispatch.uninstall!()
+    end
+end
+
+@testset "install! does not hold INSTALL_LOCK while running graph code" begin
+    graph = ComputeGraph()
+    add_input!(graph, :a, 1.0)
+    seen = Ref{Any}(nothing)
+    map!(graph, :a, :b) do a
+        # a callback running under the graph lock during `install!`
+        seen[] = (islocked(StaticDispatch.INSTALL_LOCK), StaticDispatch.isinstalled())
+        return 2a
+    end
+    try
+        StaticDispatch.install!(graph) # resolves :b in `prepare!`
+        @test seen[] == (false, false)
+    finally
+        StaticDispatch.uninstall!()
+    end
+    # `isinstalled` does not wait for INSTALL_LOCK
+    lock(StaticDispatch.INSTALL_LOCK)
+    t = try
+        t = @async StaticDispatch.isinstalled()
+        @test timedwait(() -> istaskdone(t), 10) === :ok
+        t
+    finally
+        unlock(StaticDispatch.INSTALL_LOCK)
+    end
+    @test fetch(t) === false
 end
 
 struct StaticDispatchTestEdge <: ComputePipeline.AbstractEdge end
