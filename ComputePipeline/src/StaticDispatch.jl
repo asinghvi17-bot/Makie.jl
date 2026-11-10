@@ -18,10 +18,12 @@ newly added edges or edges which were never resolved throw a
 [`StaticDispatchError`](@ref) instead of being handled dynamically.
 
 ```julia
+using ComputePipeline.StaticDispatch: StaticDispatch
+StaticDispatch.track_graphs!() # record the graphs built from here on
 graph = ComputeGraph()
 add_input!(graph, :a, 1.0)
 map!(x -> 2x, graph, :a, :b)
-ComputePipeline.StaticDispatch.install!(graph)
+StaticDispatch.install!(graph) # also stops tracking
 # compile entry points which use `graph`
 ```
 """
@@ -121,13 +123,44 @@ function slot_type(ref::RefValue)
     return isassigned(ref) ? typeof(ref[]) : Any
 end
 
-# Graph observable => the graph which created it with `get_observable!`. Reads the
-# `observables` of every live graph, relying on `install!`'s precondition that no
-# other task modifies graphs meanwhile.
+"""
+    track_graphs!()
+
+Starts recording every `ComputeGraph` constructed from now on, until
+[`install!`](@ref) succeeds or [`untrack!`](@ref) is called. `install!` uses the
+recorded graphs to find the graph which created an Observable (with
+`get_observable!`) that a collected graph is fed by, since the Observable has no
+reference to it. Call this before building the graphs. Meant for build time only:
+the recorded graphs are kept alive until tracking stops.
+"""
+function track_graphs!()
+    ComputePipeline.TRACK_GRAPHS[] = true
+    return
+end
+
+"""
+    untrack!()
+
+Stops recording graphs (see [`track_graphs!`](@ref)) and forgets the recorded ones.
+"""
+function untrack!()
+    ComputePipeline.TRACK_GRAPHS[] = false
+    @lock ComputePipeline.TRACKED_GRAPHS_LOCK empty!(ComputePipeline.TRACKED_GRAPHS)
+    return
+end
+
+"""
+    istracking()
+
+Whether graphs are being recorded (see [`track_graphs!`](@ref)).
+"""
+istracking() = ComputePipeline.TRACK_GRAPHS[]
+
+# Graph observable => the graph which created it with `get_observable!`, for the
+# graphs recorded by `track_graphs!`. Reads their `observables`, relying on
+# `install!`'s precondition that no other task modifies graphs meanwhile.
 function observable_producers()
-    graphs = @lock ComputePipeline.GRAPH_REGISTRY_LOCK ComputeGraph[
-        ref.value for ref in ComputePipeline.GRAPH_REGISTRY if ref.value isa ComputeGraph
-    ]
+    graphs = @lock ComputePipeline.TRACKED_GRAPHS_LOCK copy(ComputePipeline.TRACKED_GRAPHS)
     producers = IdDict{Observable, ComputeGraph}()
     for graph in graphs, obs in values(graph.observables)
         producers[obs] = graph
@@ -306,10 +339,38 @@ function collect_shapes(
     found = IdDict{ComputeGraph, Nothing}()
     foreach(root -> find_graphs!(found, root), roots)
     graphs = collect(keys(found))
+    istracking() || warn_unknown_producers(graphs)
     skipped = prepare ? prepare!(graphs; resolve) : ComputeEdge{ComputeGraph}[]
     isempty(graphs) && return shapes_of(graphs, skipped, inputs, outputs)
     # `lock_for` locks a graph and all graphs connected to it
     return @lock ComputePipeline.lock_for(first(graphs)) shapes_of(graphs, skipped, inputs, outputs)
+end
+
+# Names of the inputs fed by an Observable which none of `graphs` created. Either a
+# plain Observable or one of a graph not found (without `track_graphs!`).
+function unknown_producer_inputs(graphs)
+    known = IdDict{Observable, Nothing}()
+    for graph in graphs, obs in values(graph.observables)
+        known[obs] = nothing
+    end
+    names = Symbol[]
+    for graph in graphs, of in graph.observerfunctions
+        updater = of.f
+        if updater isa ComputePipeline.ObservableInputUpdater && !haskey(known, of.observable)
+            updater.key in names || push!(names, updater.key)
+        end
+    end
+    return names
+end
+
+function warn_unknown_producers(graphs)
+    names = unknown_producer_inputs(graphs)
+    isempty(names) && return
+    @warn """StaticDispatch: the inputs $(join(names, ", ")) are fed by Observables which no graph \
+        found by `install!` created. If one comes from `get_observable!` of another graph, that graph is \
+        missed: pass it to `install!` or call `StaticDispatch.track_graphs!()` before building the graphs. \
+        Plain Observables need neither."""
+    return
 end
 
 function shapes_of(graphs::Vector{ComputeGraph}, skipped, inputs, outputs)
@@ -681,8 +742,16 @@ runtime) and [`prepare!`](@ref).
 Graphs are connected through edges between them and through Observables they
 share as inputs (`add_input!(graph, key, ::Observable)`). An Observable from
 `get_observable!` also connects the graph which created it with the graphs it
-feeds, in both directions. Observables derived from these with `map` or
+feeds. From the creating graph to the fed graphs this always works, but in the
+other direction the Observable has no reference to its graph: that graph is only
+found if it was constructed after [`track_graphs!`](@ref), or if it is passed in `roots`.
+Without tracking, `install!` warns about inputs fed by Observables which none of
+the collected graphs created. Observables derived from these with `map` or
 `connect!` are not followed.
+
+Typical build-time use: `track_graphs!()`, build the graphs (e.g. a scene),
+`install!(roots...)`, then compile. A successful `install!` stops tracking and
+forgets the recorded graphs (like [`untrack!`](@ref)).
 
 `install!` and [`uninstall!`](@ref) are build-time operations: while they run,
 no other task may update, resolve, build or modify any `ComputeGraph` (including
@@ -716,6 +785,7 @@ function install!(roots...; mod::Module = StaticDispatch, kwargs...)
         check_not_installed()
         eval_tracked!(mod, defs)
     end
+    untrack!()
     return shapes
 end
 

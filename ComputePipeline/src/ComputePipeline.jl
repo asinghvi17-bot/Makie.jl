@@ -621,29 +621,21 @@ function ComputeGraph()
     )
 
     on(GraphObservablesUpdater(graph), graph.onchange)
-    register_graph!(graph)
+    TRACK_GRAPHS[] && track_graph!(graph)
 
     return graph
 end
 
-# Every `ComputeGraph`, held weakly and registered once at construction. Lets
-# `StaticDispatch` find the graph which created an Observable (`get_observable!`)
-# fed into another graph, since the Observable has no reference to it. Dead
-# entries are removed whenever the length doubled since the last pruning, so this
-# holds at most about twice the peak number of live graphs.
-const GRAPH_REGISTRY = WeakRef[]
-const GRAPH_REGISTRY_LOCK = ReentrantLock()
-# length at which dead entries are removed next
-const GRAPH_REGISTRY_PRUNE_AT = RefValue(64)
+# Opt-in, build-time tracking of constructed graphs for `StaticDispatch` (see
+# `StaticDispatch.track_graphs!`). Lets it find the graph which created an
+# Observable (`get_observable!`) fed into another graph, since the Observable has
+# no reference to it. Off by default; then `ComputeGraph()` only loads the flag.
+const TRACK_GRAPHS = Threads.Atomic{Bool}(false)
+const TRACKED_GRAPHS = ComputeGraph[]
+const TRACKED_GRAPHS_LOCK = ReentrantLock()
 
-function register_graph!(graph::ComputeGraph)
-    @lock GRAPH_REGISTRY_LOCK begin
-        push!(GRAPH_REGISTRY, WeakRef(graph))
-        if length(GRAPH_REGISTRY) >= GRAPH_REGISTRY_PRUNE_AT[]
-            filter!(ref -> !isnothing(ref.value), GRAPH_REGISTRY)
-            GRAPH_REGISTRY_PRUNE_AT[] = max(64, 2 * length(GRAPH_REGISTRY))
-        end
-    end
+@noinline function track_graph!(graph::ComputeGraph)
+    @lock TRACKED_GRAPHS_LOCK push!(TRACKED_GRAPHS, graph)
     return
 end
 
