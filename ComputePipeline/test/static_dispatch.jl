@@ -257,6 +257,32 @@ end
     end
 end
 
+@testset "graph registry" begin
+    registered(g) = @lock ComputePipeline.GRAPH_REGISTRY_LOCK count(r -> r.value === g, ComputePipeline.GRAPH_REGISTRY)
+    graph = ComputeGraph()
+    add_input!(graph, :a, 1)
+    @test registered(graph) == 1
+    # once per graph, not per (re)created Observable
+    for _ in 1:3
+        ComputePipeline.get_observable!(graph, :a)
+        empty!(graph.observables)
+    end
+    @test registered(graph) == 1
+    # dead graphs are removed
+    for i in 1:5000
+        ComputeGraph()
+        i % 500 == 0 && GC.gc()
+    end
+    @test length(ComputePipeline.GRAPH_REGISTRY) < 2000
+    @test registered(graph) == 1
+end
+
+@testset "is_same pairs warning" begin
+    types = [Vector{T} for T in (Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float64)]
+    @test_logs (:warn, r"72 pairs of different value types") StaticDispatch.is_same_chain(:a, :b, types, "test")
+    @test_logs StaticDispatch.is_same_chain(:a, :b, types[1:3], "test")
+end
+
 function cross_type_steps!(graph, calls)
     out = Int[]
     # :u is [1] (Int) at first. Equal, different type; different; equal, different type; same input
