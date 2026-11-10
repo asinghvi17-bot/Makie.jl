@@ -1901,3 +1901,45 @@ end
     put!(gate, nothing)
     @test fetch(task) == 2
 end
+
+@testset "NestedSearchTree getindex" begin
+    using ComputePipeline: NestedSearchTree, TemporarySearchResult, add_key!, merged_key
+
+    tree = NestedSearchTree()
+    add_key!(tree, :a, :b, :c)
+    add_key!(tree, :a, :b, :d)
+
+    temp_a = tree[:a]
+    temp_b = temp_a[:b]
+    temp_c = temp_b[:c]
+    temp_d = temp_b[:d]
+    @test temp_a isa TemporarySearchResult
+    @test temp_a.keys == [:a]
+    @test temp_b.keys == [:a, :b]
+    @test temp_c.keys == [:a, :b, :c]
+    @test temp_d.keys == [:a, :b, :d]
+    @test ComputePipeline.isfinal(temp_c)
+    @test merged_key(temp_c) === Symbol("a.b.c")
+
+    # indexing returns a new result and does not modify or share the keys of the one it was called on
+    @test temp_a.keys == [:a]
+    @test temp_b.keys !== temp_a.keys
+    @test temp_c.keys !== temp_d.keys
+    @test temp_b.keys == [:a, :b]
+
+    # keys that don't exist report the full path
+    err = try
+        temp_b[:x]
+        nothing
+    catch e
+        e
+    end
+    @test err isa KeyError
+    @test err.key === Symbol("a.b.x")
+    @test temp_b.keys == [:a, :b]
+
+    # The keys of a result are always a Vector{Symbol}. `[temp.keys..., key]` is a splat of a Vector, which infers as
+    # `Union{Vector{Any}, Vector{Symbol}}` and is an unresolved call in ahead of time compilation (juliac --trim),
+    # reachable from every setproperty! of a plot.
+    @test Base.return_types(getindex, Tuple{TemporarySearchResult, Symbol}) == [TemporarySearchResult]
+end
