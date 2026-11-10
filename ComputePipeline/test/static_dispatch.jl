@@ -220,8 +220,8 @@ end
         g1.y[], g2.z[], g3.w[]
     end
     try
-        # (g1's input is fed by a plain Observable)
-        shapes = @test_logs (:warn, r"the inputs x are fed") StaticDispatch.install!(g1)
+        # g1's input is fed by a plain Observable: no warning, only a debug message
+        shapes = @test_logs (:debug, r"the inputs x are fed") min_level = Base.CoreLogging.Debug match_mode = :any StaticDispatch.install!(g1)
         @test length(shapes.graphs) == 3
         @invokelatest setindex!(obs, 3.0)
         @test @invokelatest(g1.y[]) == 6.0
@@ -278,7 +278,8 @@ end
     # the producer can't be found from g2, install! warns
     g2, updater = build_producer_graphs()
     try
-        shapes = @test_logs (:warn, r"the inputs y are fed by Observables which no graph") StaticDispatch.install!(g2)
+        # can't be told apart from a plain Observable: no warning, only a debug message
+        shapes = @test_logs (:debug, r"the inputs y are fed by Observables which no collected") min_level = Base.CoreLogging.Debug match_mode = :any StaticDispatch.install!(g2)
         @test length(shapes.graphs) == 1
     finally
         StaticDispatch.uninstall!()
@@ -365,24 +366,70 @@ end
     end
 end
 
-@testset "install! warns about a producer built before tracking" begin
-    g1 = ComputeGraph()
-    add_input!(g1, :x, 1.0)
-    map!(x -> 2x, g1, :x, :y)
+@testset "install! with a producer built before tracking" begin
+    function producer()
+        g1 = ComputeGraph()
+        add_input!(g1, :x, 1.0)
+        map!(x -> 2x, g1, :x, :y)
+        return g1
+    end
+    function consumer(obs)
+        g2 = ComputeGraph()
+        add_input!(g2, :y, obs)
+        map!(y -> y + 1, g2, :y, :z)
+        g2.z[]
+        return g2
+    end
+    # its Observable is created while tracking: found
+    g1 = producer()
     try
-        g2 = StaticDispatch.track_graphs!() do
-            g2 = ComputeGraph()
-            add_input!(g2, :y, ComputePipeline.get_observable!(g1, :y))
-            map!(y -> y + 1, g2, :y, :z)
-            g2.z[]
-            shapes = @test_logs (:warn, r"the inputs y are fed by Observables which no graph") StaticDispatch.install!(g2)
-            @test length(shapes.graphs) == 1
-            return g2
+        StaticDispatch.track_graphs!() do
+            g2 = consumer(ComputePipeline.get_observable!(g1, :y))
+            shapes = @test_logs StaticDispatch.install!(g2) # no warning
+            @test length(shapes.graphs) == 2
+            @test isempty(ComputePipeline.TRACKED_OBSERVABLES)
         end
-        @test !StaticDispatch.istracking()
+        @invokelatest setproperty!(g1, :x, 3.0)
+        @test @invokelatest(g1.y[]) == 6.0
     finally
         StaticDispatch.uninstall!()
     end
+    # its Observable is created before tracking: not found, only a debug message
+    g1 = producer()
+    obs = ComputePipeline.get_observable!(g1, :y)
+    try
+        StaticDispatch.track_graphs!() do
+            g2 = consumer(obs)
+            shapes = @test_logs (:debug, r"the inputs y are fed") min_level = Base.CoreLogging.Debug match_mode = :any StaticDispatch.install!(g2)
+            @test length(shapes.graphs) == 1
+        end
+    finally
+        StaticDispatch.uninstall!()
+    end
+    @test !StaticDispatch.istracking()
+end
+
+@testset "Union slots are split into concrete branches" begin
+    U = Union{Nothing, Float64}
+    @test Set(StaticDispatch.split_unions((U, nothing, Int))) ==
+        Set([(Nothing, nothing, Int), (Float64, nothing, Int)])
+    @test length(StaticDispatch.split_unions((U, U))) == 4
+    @test StaticDispatch.split_unions((nothing,)) == [(nothing,)]
+    @test StaticDispatch.split_unions(()) == [()]
+    # more than MAX_UNION_SPLITS combinations keep the Unions
+    U4 = Union{Nothing, Float64, Int, Bool}
+    @test StaticDispatch.split_unions((U4, U4, U4)) == [(U4, U4, U4)]
+    # the generated method builds concretely typed NamedTuples per member
+    graph = ComputeGraph()
+    add_input!(graph, :a, -1.0)
+    map!(a -> Ref{U}(a < 0 ? nothing : a), graph, :a, :u)
+    map!(u -> something(u, 0.0), graph, :u, :down)
+    graph.down[]
+    graph.a = 1.0
+    graph.down[]
+    code = string(StaticDispatch.generate(graph))
+    @test occursin("::Nothing,)", code) && occursin("::Float64,)", code)
+    @test !occursin("::Union{Nothing, Float64},)", code)
 end
 
 @testset "is_same pairs warning" begin

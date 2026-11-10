@@ -591,7 +591,9 @@ function get_observable!(attr::ComputeGraph, key::Symbol; use_deepcopy = true)
         initial_value = use_deepcopy ? deepcopy(val[]) : val[]
         # The graph already does ignore_equal_values = true checks when data is
         # not updated in-place, so it's useless to add it here
-        return Observable{eltype(val.value)}(initial_value)
+        obs = Observable{eltype(val.value)}(initial_value)
+        TRACK_GRAPHS[] && track_observable!(obs, attr)
+        return obs
     end
 end
 
@@ -632,12 +634,20 @@ end
 # no reference to it. Off by default; then `ComputeGraph()` only loads the flag.
 const TRACK_GRAPHS = Threads.Atomic{Bool}(false)
 const TRACKED_GRAPHS = ComputeGraph[]
+# Observables created by `get_observable!` while tracking => their graph (also for
+# graphs constructed before tracking started)
+const TRACKED_OBSERVABLES = IdDict{Observable, ComputeGraph}()
 const TRACKED_GRAPHS_LOCK = ReentrantLock()
 
 # The flag is only changed under `TRACKED_GRAPHS_LOCK`, so re-checking it under the
 # lock keeps a constructor which saw `true` from adding a graph after tracking stopped
 @noinline function track_graph!(graph::ComputeGraph)
     @lock TRACKED_GRAPHS_LOCK TRACK_GRAPHS[] && push!(TRACKED_GRAPHS, graph)
+    return
+end
+
+@noinline function track_observable!(obs::Observable, graph::ComputeGraph)
+    @lock TRACKED_GRAPHS_LOCK TRACK_GRAPHS[] && (TRACKED_OBSERVABLES[obs] = graph)
     return
 end
 

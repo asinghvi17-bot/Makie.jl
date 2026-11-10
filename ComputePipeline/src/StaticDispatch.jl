@@ -23,10 +23,11 @@ graph = StaticDispatch.track_graphs!() do # record the graphs built in this bloc
     g = ComputeGraph()
     add_input!(g, :a, 1.0)
     map!(x -> 2x, g, :a, :b)
-    StaticDispatch.install!(g)
+    # only the edges between the inputs set and the nodes read at runtime
+    StaticDispatch.install!(g; inputs = [g.a], outputs = [g.b])
     return g
 end
-# compile entry points which use `graph`
+# compile entry points which set `graph.a` and read `graph.b[]`
 ```
 """
 module StaticDispatch
@@ -173,6 +174,7 @@ function untrack!()
     @lock ComputePipeline.TRACKED_GRAPHS_LOCK begin
         ComputePipeline.TRACK_GRAPHS[] = false
         empty!(ComputePipeline.TRACKED_GRAPHS)
+        empty!(ComputePipeline.TRACKED_OBSERVABLES)
     end
     return
 end
@@ -188,8 +190,9 @@ istracking() = ComputePipeline.TRACK_GRAPHS[]
 # graphs recorded by `track_graphs!`. Reads their `observables`, relying on
 # `install!`'s precondition that no other task modifies graphs meanwhile.
 function observable_producers()
-    graphs = @lock ComputePipeline.TRACKED_GRAPHS_LOCK copy(ComputePipeline.TRACKED_GRAPHS)
-    producers = IdDict{Observable, ComputeGraph}()
+    graphs, producers = @lock ComputePipeline.TRACKED_GRAPHS_LOCK begin
+        copy(ComputePipeline.TRACKED_GRAPHS), copy(ComputePipeline.TRACKED_OBSERVABLES)
+    end
     for graph in graphs, obs in values(graph.observables)
         producers[obs] = graph
     end
@@ -367,7 +370,7 @@ function collect_shapes(
     found = IdDict{ComputeGraph, Nothing}()
     foreach(root -> find_graphs!(found, root), roots)
     graphs = collect(keys(found))
-    warn_unknown_producers(graphs)
+    log_unknown_producers(graphs)
     skipped = prepare ? prepare!(graphs; resolve) : ComputeEdge{ComputeGraph}[]
     isempty(graphs) && return shapes_of(graphs, skipped, inputs, outputs)
     # `lock_for` locks a graph and all graphs connected to it
@@ -375,7 +378,9 @@ function collect_shapes(
 end
 
 # Names of the inputs fed by an Observable which none of `graphs` created. Either a
-# plain Observable or one of a graph not found (not built after `track_graphs!`).
+# plain Observable (e.g. a Scene's camera matrices) or one created by
+# `get_observable!` of a graph not found, outside of tracking. An Observable does
+# not tell which, so this is only a debug message.
 function unknown_producer_inputs(graphs)
     known = IdDict{Observable, Nothing}()
     for graph in graphs, obs in values(graph.observables)
@@ -391,13 +396,13 @@ function unknown_producer_inputs(graphs)
     return names
 end
 
-function warn_unknown_producers(graphs)
+function log_unknown_producers(graphs)
     names = unknown_producer_inputs(graphs)
     isempty(names) && return
-    @warn """StaticDispatch: the inputs $(join(names, ", ")) are fed by Observables which no graph \
-        found by `install!` created. If one comes from `get_observable!` of another graph, that graph is \
-        missed: pass it to `install!` or build it after `StaticDispatch.track_graphs!()`. \
-        Plain Observables need neither."""
+    @debug """StaticDispatch: the inputs $(join(names, ", ")) are fed by Observables which no collected \
+        graph created. Fine for plain Observables. If one comes from `get_observable!` of another graph \
+        before `track_graphs!()`, that graph is missed: pass it to `install!` or call `get_observable!` \
+        while tracking."""
     return
 end
 
@@ -509,6 +514,18 @@ end
 
 and_all(conds) = isempty(conds) ? true : foldl((a, b) -> :($a && $b), conds)
 
+# The combinations of concrete types for slots of small Union types (`slot_type`),
+# one branch each: a `NamedTuple{names}(values)` with a Union-typed value has an
+# abstract type, which would make the callback call dynamic. Slots typed `nothing`
+# or concretely stay as they are. Above `MAX_UNION_SPLITS` combinations the Unions
+# are kept.
+function split_unions(types::Tuple)
+    choices = map(t -> something(union_members(t), Any[t]), types)
+    prod(length, choices; init = 1) > MAX_UNION_SPLITS && return [types]
+    return vec(collect(Iterators.product(choices...)))
+end
+const MAX_UNION_SPLITS = 16
+
 function typed_edge_method(shapes::Shapes)
     branches = Any[]
     for (T, variants) in shapes.typed_edges
@@ -521,7 +538,8 @@ function typed_edge_method(shapes::Shapes)
         end
         innames = fieldnames(IT)
         sub = Any[]
-        for (ins, outs, outnames) in variants
+        for (ins0, outs0, outnames) in variants, slots in split_unions((ins0..., outs0...))
+            ins, outs = slots[1:length(ins0)], slots[(length(ins0) + 1):end]
             inrefs = [:(e.inputs[$i]) for i in eachindex(innames)]
             outrefs = [:(e.outputs[$i]) for i in eachindex(outnames)]
             conds = vcat(slot_conditions(inrefs, ins), slot_conditions(outrefs, outs))
@@ -772,13 +790,19 @@ share as inputs (`add_input!(graph, key, ::Observable)`). An Observable from
 `get_observable!` also connects the graph which created it with the graphs it
 feeds. From the creating graph to the fed graphs this always works, but in the
 other direction the Observable has no reference to its graph: that graph is only
-found if it was constructed after [`track_graphs!`](@ref), or if it is passed in `roots`.
-`install!` warns about inputs fed by Observables which none of the collected
-graphs created (also with tracking on, for graphs built before it started). Observables derived from these with `map` or
-`connect!` are not followed.
+found if it was constructed after [`track_graphs!`](@ref), if the Observable was
+created by `get_observable!` while tracking, or if the graph is passed in `roots`.
+An Observable created before tracking can't be told apart from a plain Observable
+(such as a Scene's camera matrices, which need no producer), so `install!` doesn't
+warn about it; the inputs fed by such Observables are listed in a debug message
+(`ENV["JULIA_DEBUG"] = "ComputePipeline"`). Observables derived from these with
+`map` or `connect!` are not followed.
 
 Typical build-time use: in a `track_graphs!() do ... end` block, build the graphs
-(e.g. a scene) and call `install!(roots...)`; then compile. A successful
+(e.g. a scene) and call `install!(roots...; inputs, outputs)`; then compile.
+Narrowing with `inputs` (the inputs updated at runtime) and `outputs` (the nodes
+read at runtime) is recommended: without them every edge of every connected graph
+is compiled, e.g. a whole Makie plot's attributes graph and its scene's graph. A successful
 `install!` stops tracking and forgets the recorded graphs (like [`untrack!`](@ref)).
 Without the block, a failed build leaves tracking on until `untrack!()` is called.
 Tracking sessions can't be nested (`track_graphs!` throws if tracking is on).
