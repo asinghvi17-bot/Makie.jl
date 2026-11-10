@@ -583,6 +583,7 @@ function get_observable!(attr::ComputeGraph, key::Symbol; use_deepcopy = true)
     # This requires us to copy data every time we update and we can't use
     # `copy` because that is not always available (e.g. not for Rect)
     return get!(attr.observables, key) do
+        isempty(attr.observables) && register_observable_graph!(attr)
         if use_deepcopy
             push!(attr.should_deepcopy, key)
         end
@@ -593,6 +594,25 @@ function get_observable!(attr::ComputeGraph, key::Symbol; use_deepcopy = true)
         # not updated in-place, so it's useless to add it here
         return Observable{eltype(val.value)}(initial_value)
     end
+end
+
+# Graphs which created observables with `get_observable!`, held weakly. Lets
+# `StaticDispatch` find the graph producing an Observable another graph consumes,
+# since the Observable has no reference to it.
+const OBSERVABLE_GRAPHS = WeakRef[]
+const OBSERVABLE_GRAPHS_LOCK = ReentrantLock()
+# length at which dead entries are removed next
+const OBSERVABLE_GRAPHS_PRUNE_AT = RefValue(64)
+
+function register_observable_graph!(graph::ComputeGraph)
+    @lock OBSERVABLE_GRAPHS_LOCK begin
+        push!(OBSERVABLE_GRAPHS, WeakRef(graph))
+        if length(OBSERVABLE_GRAPHS) >= OBSERVABLE_GRAPHS_PRUNE_AT[]
+            filter!(ref -> !isnothing(ref.value), OBSERVABLE_GRAPHS)
+            OBSERVABLE_GRAPHS_PRUNE_AT[] = max(64, 2 * length(OBSERVABLE_GRAPHS))
+        end
+    end
+    return
 end
 
 function get_observable!(c::Computed; use_deepcopy = true)

@@ -121,7 +121,22 @@ function slot_type(ref::RefValue)
     return isassigned(ref) ? typeof(ref[]) : Any
 end
 
+# Graph observable => the graph which created it with `get_observable!`
+function observable_producers()
+    producers = IdDict{Observable, ComputeGraph}()
+    @lock ComputePipeline.OBSERVABLE_GRAPHS_LOCK for ref in ComputePipeline.OBSERVABLE_GRAPHS
+        graph = ref.value
+        graph isa ComputeGraph || continue
+        foreach(obs -> producers[obs] = graph, values(graph.observables))
+    end
+    return producers
+end
+
 function find_graphs!(graphs::IdDict{ComputeGraph, Nothing}, graph::ComputeGraph)
+    return find_graphs!(graphs, graph, observable_producers())
+end
+
+function find_graphs!(graphs::IdDict{ComputeGraph, Nothing}, graph::ComputeGraph, producers)
     haskey(graphs, graph) && return graphs
     graphs[graph] = nothing
     for node in values(graph.outputs)
@@ -130,28 +145,31 @@ function find_graphs!(graphs::IdDict{ComputeGraph, Nothing}, graph::ComputeGraph
         edge isa ComputeEdge || continue
         # parent graphs
         for input in edge.inputs
-            hasparent(input) && find_graphs!(graphs, ComputePipeline.parent_graph(input.parent))
+            hasparent(input) && find_graphs!(graphs, ComputePipeline.parent_graph(input.parent), producers)
         end
         # child graphs
         for dep in edge.dependents
-            find_graphs!(graphs, ComputePipeline.parent_graph(dep))
+            find_graphs!(graphs, ComputePipeline.parent_graph(dep), producers)
         end
     end
     for input in values(graph.inputs), dep in input.dependents
-        find_graphs!(graphs, ComputePipeline.parent_graph(dep))
+        find_graphs!(graphs, ComputePipeline.parent_graph(dep), producers)
     end
-    # graphs fed by the same Observables (`add_input!(graph, key, ::Observable)`),
-    # including Observables of this graph's nodes (`get_observable!`)
+    # graphs connected through Observables: graphs fed by the same Observables
+    # (`add_input!(graph, key, ::Observable)`), the graphs producing them and the
+    # graphs fed by Observables of this graph's nodes (`get_observable!`)
     for of in graph.observerfunctions
-        of.f isa ComputePipeline.ObservableInputUpdater && find_observable_graphs!(graphs, of.observable)
+        of.f isa ComputePipeline.ObservableInputUpdater || continue
+        find_observable_graphs!(graphs, of.observable, producers)
+        haskey(producers, of.observable) && find_graphs!(graphs, producers[of.observable], producers)
     end
-    foreach(obs -> find_observable_graphs!(graphs, obs), values(graph.observables))
+    foreach(obs -> find_observable_graphs!(graphs, obs, producers), values(graph.observables))
     return graphs
 end
 
-function find_observable_graphs!(graphs::IdDict{ComputeGraph, Nothing}, obs)
+function find_observable_graphs!(graphs::IdDict{ComputeGraph, Nothing}, obs, producers)
     for (_, listener) in Observables.listeners(obs)
-        listener isa ComputePipeline.ObservableInputUpdater && find_graphs!(graphs, listener.graph)
+        listener isa ComputePipeline.ObservableInputUpdater && find_graphs!(graphs, listener.graph, producers)
     end
     return graphs
 end
@@ -286,6 +304,12 @@ function collect_shapes(
     foreach(root -> find_graphs!(found, root), roots)
     graphs = collect(keys(found))
     skipped = prepare ? prepare!(graphs; resolve) : ComputeEdge{ComputeGraph}[]
+    isempty(graphs) && return shapes_of(graphs, skipped, inputs, outputs)
+    # `lock_for` locks a graph and all graphs connected to it
+    return @lock ComputePipeline.lock_for(first(graphs)) shapes_of(graphs, skipped, inputs, outputs)
+end
+
+function shapes_of(graphs::Vector{ComputeGraph}, skipped, inputs, outputs)
     live = isnothing(inputs) ? nothing : live_edges(inputs)
     needed = isnothing(outputs) ? nothing : ancestor_edges(outputs)
     islive(edge) = (isnothing(live) || haskey(live, edge)) && (isnothing(needed) || haskey(needed, edge))
@@ -333,7 +357,9 @@ function collect_shapes(
             push!(get!(Set{Any}, shapes.typed_edges, typeof(te)), (ins, outs, outnames))
         end
         for (key, obs) in graph.observables
-            node = graph.outputs[key]
+            # (other code may cache Observables under keys which are not nodes)
+            node = get(graph.outputs, key, nothing)
+            isnothing(node) && continue
             hasparent(node) && !islive(node.parent) && continue
             isdefined(node, :value) && push!(shapes.observables, (typeof(obs), typeof(node.value)))
         end
@@ -475,17 +501,42 @@ function input_method(shapes::Shapes)
     )
 end
 
-function is_same_input_method(shapes::Shapes)
-    branches = Any[]
-    for V in shapes.input_value_types
-        isconcretetype(V) || continue
-        push!(branches, :(old isa $V && value isa $V) => :(return ComputePipeline.is_same(old::$V, value::$V)))
+# Whether `is_same(::A, ::B)` calls a method other than the fallback for values of
+# unrelated types, which returns `false`
+function has_is_same_method(@nospecialize(A), @nospecialize(B))
+    A === B && return true
+    m = try
+        which(ComputePipeline.is_same, Tuple{A, B})
+    catch
+        return true # e.g. ambiguous, the generated call throws like the native one
     end
-    # Values of different types are "not the same", i.e. the input updates
+    return m !== which(ComputePipeline.is_same, Tuple{Any, Any})
+end
+
+# `return is_same(old, new)` with static calls for every pair of the concrete `types`
+# for which `is_same` has a method (e.g. `Vector{Int}` and `Vector{Float64}`), and
+# `return false` for other values, like the fallback method of `is_same`
+function is_same_chain(old::Symbol, new::Symbol, types)
+    types = filter(isconcretetype, collect(Type, types))
+    outer = Any[]
+    for A in types
+        inner = Any[]
+        # same type first, it's the common case
+        for B in sort(types; by = B -> B !== A)
+            has_is_same_method(A, B) || continue
+            push!(inner, :($new isa $B) => :(return ComputePipeline.is_same($old::$A, $new::$B)))
+        end
+        push!(outer, :($old isa $A) => isa_chain(inner, :(return false)))
+    end
+    return isa_chain(outer, :(return false))
+end
+
+function is_same_input_method(shapes::Shapes)
+    # Values of other types are "not the same", i.e. the input updates
     return :(
         function ComputePipeline.is_same_input_value(input::Input{ComputeGraph}, @nospecialize(value))
             old = input.value
-            $(isa_chain(branches, :(return false)))
+            $(is_same_chain(:old, :value, shapes.input_value_types))
         end
     )
 end
@@ -493,18 +544,13 @@ end
 function is_same_cached_methods(shapes::Shapes)
     methods = Any[]
     for (R, Vs) in shapes.abstract_refs
-        branches = Any[]
         # all members of small Union slots, not just the ones seen at `install!`
         members = union_members(eltype(R))
-        for V in (isnothing(members) ? Vs : members)
-            isconcretetype(V) || continue
-            push!(branches, :(old isa $V && new isa $V) => :(return ComputePipeline.is_same(old::$V, new::$V)))
-        end
         push!(
             methods, :(
                 function ComputePipeline.is_same_cached(ref::$R, @nospecialize(new))
                     old = ref[]
-                    $(isa_chain(branches, :(return false)))
+                    $(is_same_chain(:old, :new, isnothing(members) ? Vs : members))
                 end
             )
         )
@@ -603,8 +649,14 @@ generate(roots...; kwargs...) = generate(collect_shapes(roots...; kwargs...))
 
 # Methods added by `install!`. `install!`/`uninstall!` are meant to be called at
 # build time, but they take `INSTALL_LOCK` so concurrent calls can't interleave.
+# Lock order: `INSTALL_LOCK` is only held while methods are evaluated or deleted,
+# never while taking a graph lock (`lock_for`) or running graph code (callbacks,
+# Observable listeners), and `isinstalled` reads `IS_INSTALLED` without locking.
+# So a callback running under a graph lock can't wait on `INSTALL_LOCK` while
+# `install!` holds it and waits on the graph lock.
 const INSTALLED = Method[]
 const INSTALL_LOCK = ReentrantLock()
+const IS_INSTALLED = Threads.Atomic{Bool}(false)
 
 """
     install!(roots...; inputs = nothing, outputs = nothing, prepare = true, resolve = true, mod = StaticDispatch)
@@ -617,8 +669,14 @@ generated code to edges between the inputs updated and the nodes read at
 runtime) and [`prepare!`](@ref).
 
 Graphs are connected through edges between them and through Observables they
-share as inputs (`add_input!(graph, key, ::Observable)`, also with Observables
-from `get_observable!`).
+share as inputs (`add_input!(graph, key, ::Observable)`). An Observable from
+`get_observable!` also connects the graph which created it with the graphs it
+feeds, in both directions. Observables derived from these with `map` or
+`connect!` are not followed.
+
+`install!` collects the types without holding its own lock (resolving nodes in
+[`prepare!`](@ref) may run callbacks), so it may be called while other tasks
+resolve graphs, and [`isinstalled`](@ref) does not lock.
 
 Call this once, after all graphs are built and resolved, before compiling. The
 graphs keep working natively afterwards, but throw a [`StaticDispatchError`](@ref)
@@ -630,28 +688,40 @@ replacing inputs or edges (e.g. with `register_computation!`, `delete!` or an
 edge modification API) is not seen by the installed methods.
 """
 function install!(roots...; mod::Module = StaticDispatch, kwargs...)
+    check_not_installed()
+    # without `INSTALL_LOCK`: this takes the graph lock and may run callbacks
+    shapes = collect_shapes(roots...; kwargs...)
+    defs = generate(shapes).args
     @lock INSTALL_LOCK begin
-        isempty(INSTALLED) || error("StaticDispatch is already installed. Call `uninstall!()` first.")
-        shapes = collect_shapes(roots...; kwargs...)
-        eval_tracked!(mod, generate(shapes).args)
-        return shapes
+        check_not_installed()
+        eval_tracked!(mod, defs)
     end
+    return shapes
+end
+
+function check_not_installed()
+    isinstalled() && error("StaticDispatch is already installed. Call `uninstall!()` first.")
+    return
 end
 
 # Evaluates the method definitions `defs` in `mod` and records every method they add
 # in `INSTALLED`, also if one of them throws, so `uninstall!` can remove them.
 function eval_tracked!(mod::Module, defs)
     @lock INSTALL_LOCK begin
-        for def in defs
-            (def isa Expr) || continue
-            before = Set{Method}(installed_candidates())
-            try
-                Core.eval(mod, def)
-            finally
-                for m in installed_candidates()
-                    m in before || push!(INSTALLED, m)
+        try
+            for def in defs
+                (def isa Expr) || continue
+                before = Set{Method}(installed_candidates())
+                try
+                    Core.eval(mod, def)
+                finally
+                    for m in installed_candidates()
+                        m in before || push!(INSTALLED, m)
+                    end
                 end
             end
+        finally
+            IS_INSTALLED[] = !isempty(INSTALLED)
         end
     end
     return
@@ -679,10 +749,17 @@ function uninstall!()
     @lock INSTALL_LOCK begin
         foreach(Base.delete_method, INSTALLED)
         empty!(INSTALLED)
+        IS_INSTALLED[] = false
     end
     return
 end
 
-isinstalled() = @lock INSTALL_LOCK !isempty(INSTALLED)
+"""
+    isinstalled()
+
+Whether [`install!`](@ref) added methods which were not removed by
+[`uninstall!`](@ref) yet. Does not lock, so it can be called from graph callbacks.
+"""
+isinstalled() = IS_INSTALLED[]
 
 end
