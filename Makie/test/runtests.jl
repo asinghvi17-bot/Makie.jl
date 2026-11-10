@@ -73,6 +73,7 @@ end
         include("conversions/convert_arguments.jl")
         # from here
         include("conversions/conversions.jl")
+        include("conversions/named_colormaps.jl")
         include("conversions/convert_attributes.jl")
 
         include("conversions/dim-converts.jl")

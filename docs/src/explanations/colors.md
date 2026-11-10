@@ -219,3 +219,31 @@ ColorTable(getkeys("seaborn")) # hide
 ```@example colors
 ColorTable(getkeys("general")) # hide
 ```
+
+## Named colormaps in programs compiled ahead of time
+
+A colormap name such as `:magma` is looked up in the ColorSchemes registry every time it is converted, so a scheme that is registered again under an existing name replaces the old one.
+The registry holds its schemes in a `Dict{Symbol, ColorScheme}` with an abstract value type, so the lookup is dynamically dispatched.
+That is no problem natively, but programs compiled ahead of time with `juliac --trim` or [WasmCodegen.jl](https://github.com/gbaraldi/WasmCodegen.jl) in strict mode can't contain dynamic dispatch.
+
+For those programs, Makie can look names up in tables with concrete types (`Dict{String, Vector{RGBAf}}`) that it builds when it is precompiled.
+Tables with all of the roughly 1,700 colormaps would add well over a megabyte to a WebAssembly module, so they only hold the colormaps that you list in the `static_colormaps` preference of Makie, plus the default colormap `:viridis`.
+Set it in the project that you compile in, before compiling, and restart Julia so that Makie is recompiled:
+
+```julia
+using Makie
+Makie.set_static_colormaps!(:magma, :RdBu, "Set1") # the colormaps that the program uses
+# Makie.set_static_colormaps!(all = true)          # or all of them
+```
+
+This writes to the `LocalPreferences.toml` of the active project, which you can also edit directly:
+
+```toml
+[Makie]
+static_colormaps = ["magma", "RdBu", "Set1"]   # or "all"
+```
+
+Then `heatmap(...; colormap = :magma)`, `colormap = Reverse(:RdBu)`, `colormap = (:magma, 0.5)` and `categorical_colors(:Set1, 5)` compile.
+A name that is not in the tables throws an error that names it and says how to add it.
+`Makie.unset_static_colormaps!()` removes the preference again.
+When the preference is not set, which is the default, Makie looks names up in the registry as usual, and nothing about the tables costs anything.

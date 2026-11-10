@@ -1,0 +1,3 @@
+## Added
+
+- Added the `static_colormaps` preference (`Makie.set_static_colormaps!(:magma, "Set1")`, `Makie.unset_static_colormaps!()`) for programs compiled ahead of time with `juliac --trim` or WasmCodegen. When it is set, Makie is precompiled so that `to_colormap` and `categorical_colors` look named colormaps up in concretely typed `Dict{String, Vector{RGBAf}}` tables that hold only the listed colormaps (and the default `:viridis`), or all of them with `all = true`, instead of the dynamically dispatched ColorSchemes registry. A name that is missing from the tables throws an error that names it and says how to add it. Without the preference, nothing changes: named colormaps are looked up in the registry on every call, as before.
