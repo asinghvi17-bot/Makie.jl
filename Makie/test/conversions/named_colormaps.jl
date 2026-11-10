@@ -212,26 +212,94 @@ brewer_names = sort!(collect(intersect(keys(Makie.ColorBrewer.colorSchemes), all
         @test "viridis" in theme_colormaps
         @test theme_colormaps ⊆ Set(Makie.static_default_colormaps)
         @test Makie.static_default_colormaps ⊆ all_gradient_names
+    end
 
-        # set_static_colormaps! writes the preference (here into a temporary project, so nothing outside is touched)
-        mktempdir() do dir
-            write(joinpath(dir, "Project.toml"), "")
+    # The preference is written into temporary projects, so that nothing outside is touched.
+    @testset "set_static_colormaps! and unset_static_colormaps!" begin
+        load() = Makie.Preferences.load_preference(Makie, "static_colormaps", nothing)
+        quiet(f) = Base.CoreLogging.with_logger(f, Base.CoreLogging.NullLogger())
+        # runs `f` with the temporary project `dir` as the active one, and `lower` below it in the load path
+        function with_projects(f, dir; lower = String[])
             old_project = Base.active_project()
+            old_load_path = copy(Base.LOAD_PATH)
             try
                 Base.set_active_project(joinpath(dir, "Project.toml"))
-                Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
-                    Makie.set_static_colormaps!(:magma, "Set1")
-                    @test Makie.Preferences.load_preference(Makie, "static_colormaps") == ["magma", "Set1"]
-                    Makie.set_static_colormaps!([:plasma, "Set2"])
-                    @test Makie.Preferences.load_preference(Makie, "static_colormaps") == ["plasma", "Set2"]
-                    Makie.set_static_colormaps!(all = true)
-                    @test Makie.Preferences.load_preference(Makie, "static_colormaps") == "all"
-                    @test_throws "Unknown colormap name(s): not_a_gradient" Makie.set_static_colormaps!("not_a_gradient")
-                    Makie.unset_static_colormaps!()
-                    @test Makie.Preferences.load_preference(Makie, "static_colormaps", nothing) === nothing
-                end
+                append!(Base.LOAD_PATH, joinpath.(lower, "Project.toml"))
+                f()
             finally
+                empty!(Base.LOAD_PATH)
+                append!(Base.LOAD_PATH, old_load_path)
                 Base.set_active_project(old_project)
+            end
+            return
+        end
+        makie_uuid = string(Base.PkgId(Makie).uuid)
+
+        @testset "names are added to the existing ones" begin
+            mktempdir() do dir
+                write(joinpath(dir, "Project.toml"), "")
+                with_projects(dir) do
+                    quiet() do
+                        Makie.set_static_colormaps!(:magma, "Set1")
+                        @test load() == ["magma", "Set1"]
+                        Makie.set_static_colormaps!("Set1", [:plasma, "Set2"]) # existing names are kept, none is repeated
+                        @test load() == ["magma", "Set1", "plasma", "Set2"]
+                        Makie.set_static_colormaps!([:Accent]; replace = true)
+                        @test load() == ["Accent"]
+                        Makie.set_static_colormaps!()
+                        @test load() == ["Accent"]
+                        Makie.set_static_colormaps!(all = true)
+                        @test load() == "all"
+                        Makie.set_static_colormaps!(:magma) # all stays all
+                        @test load() == "all"
+                        Makie.set_static_colormaps!(:magma; replace = true)
+                        @test load() == ["magma"]
+                        @test_throws "Unknown colormap name(s): not_a_gradient" Makie.set_static_colormaps!("not_a_gradient")
+                        @test load() == ["magma"]
+                        Makie.unset_static_colormaps!()
+                        @test load() === nothing
+                    end
+                end
+            end
+        end
+
+        @testset "unsetting also blocks preferences of lower priority" begin
+            mktempdir() do dir
+                mktempdir() do lower
+                    write(joinpath(dir, "Project.toml"), "")
+                    write(joinpath(lower, "Project.toml"), "[extras]\nMakie = \"$makie_uuid\"\n")
+                    write(joinpath(lower, "LocalPreferences.toml"), "[Makie]\nstatic_colormaps = [\"inferno\"]\n")
+                    with_projects(dir; lower = [lower]) do
+                        @test load() == ["inferno"] # inherited
+                        quiet() do
+                            Makie.unset_static_colormaps!()
+                            @test load() === nothing
+                            @test Makie.Preferences.load_preference(Makie, "static_colormaps", "default") == "default"
+                            # the names inherited before are gone, too
+                            Makie.set_static_colormaps!(:magma)
+                            @test load() == ["magma"]
+                            Makie.unset_static_colormaps!()
+                            @test load() === nothing
+                        end
+                    end
+                end
+            end
+        end
+
+        @testset "projects that don't map Makie's UUID ignore the preference" begin
+            mktempdir() do dir
+                # a project that doesn't have Makie in its deps or extras, e.g. because it only depends on a backend
+                write(joinpath(dir, "Project.toml"), "name = \"OnlyABackend\"\n")
+                write(joinpath(dir, "LocalPreferences.toml"), "[Makie]\nstatic_colormaps = [\"magma\"]\n")
+                with_projects(dir) do
+                    @test load() === nothing # a hand-written section is ignored
+                    quiet() do
+                        Makie.set_static_colormaps!(:magma) # adds the mapping
+                    end
+                    @test occursin(makie_uuid, read(joinpath(dir, "Project.toml"), String))
+                    @test occursin("name = \"OnlyABackend\"", read(joinpath(dir, "Project.toml"), String))
+                    @test load() == ["magma"]
+                end
             end
         end
     end
@@ -264,6 +332,75 @@ if get(ENV, "MAKIE_TEST_STATIC_COLORMAPS", "false") == "true"
             @test success(pipeline(`$julia --project=$project -e $setup`; stdout = stdout, stderr = stderr))
             script = joinpath(@__DIR__, "static_colormaps_child.jl")
             @test success(pipeline(`$julia --project=$project $script`; stdout = stdout, stderr = stderr))
+        end
+    end
+
+    # A project that only depends on a package that depends on Makie (like a project that only has CairoMakie) doesn't map
+    # Makie's UUID, so Julia ignores a hand-written `[Makie]` section there. `set_static_colormaps!` adds the mapping.
+    @testset "preference in a project that has Makie only as an indirect dependency" begin
+        makie_dir = pkgdir(Makie)
+        mktempdir() do dir
+            child = joinpath(dir, "BackendLike")
+            mkpath(joinpath(child, "src"))
+            write(
+                joinpath(child, "Project.toml"), """
+                name = "BackendLike"
+                uuid = "5c1f2a3b-9d4e-4b7a-8c11-0f6e2d3a4b55"
+                version = "0.1.0"
+
+                [deps]
+                Makie = "$(Base.PkgId(Makie).uuid)"
+                """
+            )
+            write(
+                joinpath(child, "src", "BackendLike.jl"), """
+                module BackendLike
+                using Makie
+                enabled() = Makie.static_colormaps_enabled
+                end
+                """
+            )
+            project = joinpath(dir, "env")
+            mkpath(project)
+            julia = Base.julia_cmd()
+            setup = joinpath(dir, "setup.jl")
+            write(
+                setup, """
+                using Pkg
+                Pkg.develop([PackageSpec(path = $(repr(joinpath(dirname(makie_dir), "ComputePipeline")))), PackageSpec(path = $(repr(makie_dir))), PackageSpec(path = $(repr(child)))])
+                Pkg.rm("Makie") # Makie stays in the manifest, as a dependency of BackendLike only
+                """
+            )
+            @test success(pipeline(`$julia --project=$project $setup`; stdout = stdout, stderr = stderr))
+            @test !occursin("Makie", first(split(read(joinpath(project, "Project.toml"), String), "[sources]")))
+            # a hand-written section is ignored: Makie is loaded without the tables
+            write(joinpath(project, "LocalPreferences.toml"), "[Makie]\nstatic_colormaps = [\"inferno\"]\n")
+            step1 = joinpath(dir, "step1.jl")
+            write(
+                step1, """
+                using BackendLike
+                using BackendLike.Makie
+                @assert !BackendLike.enabled()
+                Makie.set_static_colormaps!("magma")
+                Makie.Preferences.set_preferences!(Makie, "precompile_workload" => false)
+                """
+            )
+            @test success(pipeline(`$julia --project=$project $step1`; stdout = stdout, stderr = stderr))
+            @test occursin(string(Base.PkgId(Makie).uuid), read(joinpath(project, "Project.toml"), String)) # the mapping
+            # after the setter, Makie is precompiled with the tables
+            step2 = joinpath(dir, "step2.jl")
+            write(
+                step2, """
+                using BackendLike
+                using BackendLike.Makie
+                @assert BackendLike.enabled()
+                @assert Makie.static_colormap_names == ["magma", "viridis"]
+                @assert Makie.to_colormap(:magma) == Makie.to_colormap(Makie.PlotUtils.get_colorscheme(:magma))
+                err = try Makie.to_colormap(:inferno) catch e e end
+                @assert err isa ErrorException && occursin("Makie.set_static_colormaps!(\\"inferno\\")", err.msg)
+                """
+            )
+            @test success(pipeline(`$julia --project=$project $step2`; stdout = stdout, stderr = stderr))
         end
     end
 end
