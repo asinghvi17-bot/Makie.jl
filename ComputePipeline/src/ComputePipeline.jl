@@ -603,7 +603,7 @@ function get_observable!(attr::ComputeGraph, key::Symbol; use_deepcopy = true)
     # To prevent this we have to disambiguate the data and do == checks here.
     # This requires us to copy data every time we update and we can't use
     # `copy` because that is not always available (e.g. not for Rect)
-    return get!(attr.observables, key) do
+    obs = get!(attr.observables, key) do
         if use_deepcopy
             push!(attr.should_deepcopy, key)
         end
@@ -612,10 +612,11 @@ function get_observable!(attr::ComputeGraph, key::Symbol; use_deepcopy = true)
         initial_value = use_deepcopy ? deepcopy(val[]) : val[]
         # The graph already does ignore_equal_values = true checks when data is
         # not updated in-place, so it's useless to add it here
-        obs = Observable{eltype(val.value)}(initial_value)
-        TRACK_GRAPHS[] && track_observable!(obs, attr)
-        return obs
+        return Observable{eltype(val.value)}(initial_value)
     end
+    # also for an Observable created before tracking started
+    TRACK_GRAPHS[] && track_observable!(obs, attr)
+    return obs
 end
 
 function get_observable!(c::Computed; use_deepcopy = true)

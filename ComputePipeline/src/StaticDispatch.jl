@@ -401,8 +401,8 @@ function log_unknown_producers(graphs)
     isempty(names) && return
     @debug """StaticDispatch: the inputs $(join(names, ", ")) are fed by Observables which no collected \
         graph created. Fine for plain Observables. If one comes from `get_observable!` of another graph \
-        before `track_graphs!()`, that graph is missed: pass it to `install!` or call `get_observable!` \
-        while tracking."""
+        before `track_graphs!()`, that graph is missed: pass it to `install!` as a root, or call \
+        `get_observable!` for that node again while tracking (before `install!`)."""
     return
 end
 
@@ -790,11 +790,13 @@ share as inputs (`add_input!(graph, key, ::Observable)`). An Observable from
 `get_observable!` also connects the graph which created it with the graphs it
 feeds. From the creating graph to the fed graphs this always works, but in the
 other direction the Observable has no reference to its graph: that graph is only
-found if it was constructed after [`track_graphs!`](@ref), if the Observable was
-created by `get_observable!` while tracking, or if the graph is passed in `roots`.
-An Observable created before tracking can't be told apart from a plain Observable
-(such as a Scene's camera matrices, which need no producer), so `install!` doesn't
-warn about it; the inputs fed by such Observables are listed in a debug message
+found if it was constructed after [`track_graphs!`](@ref), if `get_observable!`
+returned the Observable while tracking (also an existing one, so calling
+`get_observable!(graph, key)` again during tracking records an Observable created
+before), or if the graph is passed in `roots`. Otherwise an Observable created
+before tracking can't be told apart from a plain Observable (such as a Scene's
+camera matrices, which need no producer), so `install!` doesn't warn about it;
+the inputs fed by such Observables are listed in a debug message
 (`ENV["JULIA_DEBUG"] = "ComputePipeline"`). Observables derived from these with
 `map` or `connect!` are not followed.
 
