@@ -320,20 +320,23 @@ function _ispressed(parent, x, waspressed, nested::Bool)::Bool
     throw(ArgumentError("`ispressed` is not defined for $(typeof(x)), see `IsPressedInputType` for the supported types."))
 end
 
-# Iterating a Vector or Set is statically compiled (juliac `--trim`, Wasm) when its type is concrete where it is
-# iterated, and `_ispressed_collection` selects the concrete type with `isa` for these element types: buttons (`Set((a,
-# Mouse.left))` is a `Set{Enum{Int32}}`), `Union{Keyboard.Button, Mouse.Button}`, `BooleanOperator`, `Bool` and `Any`.
-# Every other element type (`[a & b]` is a `Vector{And{Keyboard.Button, Mouse.Button}}`, `Union`s, empty collections,
-# ...) is iterated the same way, but through the last line of `_ispressed_collection`.
-# Checked with a strict WasmCodegen compile (verify = :error, trim = :safe): a collection whose type is concrete at the
-# call of `ispressed` (`Vector{Keyboard.Button}`, `Vector{And{...}}`, `Set{Union{Keyboard.Button, Mouse.Button}}`,
-# `Tuple`) compiles. A button that is read as `IsPressedInputType` or `Any` (an `Observable{IsPressedInputType}`, an
-# attribute) does not, and neither does a `Vector{Any}` or a `Vector{BooleanOperator}` whose elements can again be a
-# collection: the `Set` of an unknown element type then reaches the last line of `_ispressed_collection`, and
-# iterating it is an unresolved call (`Base.KeySet`, `iterate`). `Vector` is not affected, only `Set`.
-const _COLLECTION_ELTYPES = (
-    Keyboard.Button, Mouse.Button, Enum{Int32}, Union{Keyboard.Button, Mouse.Button}, BooleanOperator, Bool, Any,
-)
+# A `Vector` or `Set` of unknown element type (a button read as `IsPressedInputType` or `Any`, or an element of a
+# `Vector{Any}`) can't be iterated by static compilation (juliac `--trim`, WasmCodegen), because `iterate` and
+# `getindex` need the memory layout of the elements. So `isa` finds the concrete type of the collection first, and
+# each of these is iterated with its own type: the element types of buttons and of operators of buttons below. When
+# the type of the collection is known the `isa` checks are removed by inference.
+#
+# Every other collection (e.g. of a custom button type, or a `Union` of element types) goes to
+# `_ispressed_collection_fallback`, which iterates it as usual. That is the one dynamic point left: it is fine
+# natively, and a static build can't compile it and replaces it. WasmCompat's Makie extension makes it throw an
+# `ArgumentError` for a Wasm build. Checked with a strict WasmCodegen compile (verify = :error, trim = :safe).
+const _COLLECTION_ELTYPES = let buttons = (Keyboard.Button, Mouse.Button)
+    (
+        buttons..., Enum{Int32}, Union{buttons...}, Bool, Any, BooleanOperator, Exclusively,
+        (And{l, r} for l in buttons for r in buttons)..., (Or{l, r} for l in buttons for r in buttons)...,
+        (Not{b} for b in buttons)...,
+    )
+end
 @eval function _ispressed_collection(parent, x, waspressed)::Bool
     $(
         (
@@ -341,6 +344,12 @@ const _COLLECTION_ELTYPES = (
                 for C in (Vector, Set) for T in _COLLECTION_ELTYPES
         )...
     )
+    return _ispressed_collection_fallback(parent, x, waspressed)
+end
+
+# The collections that are not one of `_COLLECTION_ELTYPES`. The single place with a dynamic call that static
+# compilation can't resolve, see above. Ahead-of-time builds may replace this method.
+function _ispressed_collection_fallback(parent, x, waspressed)::Bool
     return _all_ispressed(parent, x, waspressed)
 end
 
