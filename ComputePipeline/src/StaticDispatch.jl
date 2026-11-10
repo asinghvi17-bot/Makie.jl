@@ -121,13 +121,16 @@ function slot_type(ref::RefValue)
     return isassigned(ref) ? typeof(ref[]) : Any
 end
 
-# Graph observable => the graph which created it with `get_observable!`
+# Graph observable => the graph which created it with `get_observable!`. Reads the
+# `observables` of every live graph, relying on `install!`'s precondition that no
+# other task modifies graphs meanwhile.
 function observable_producers()
+    graphs = @lock ComputePipeline.GRAPH_REGISTRY_LOCK ComputeGraph[
+        ref.value for ref in ComputePipeline.GRAPH_REGISTRY if ref.value isa ComputeGraph
+    ]
     producers = IdDict{Observable, ComputeGraph}()
-    @lock ComputePipeline.OBSERVABLE_GRAPHS_LOCK for ref in ComputePipeline.OBSERVABLE_GRAPHS
-        graph = ref.value
-        graph isa ComputeGraph || continue
-        foreach(obs -> producers[obs] = graph, values(graph.observables))
+    for graph in graphs, obs in values(graph.observables)
+        producers[obs] = graph
     end
     return producers
 end
@@ -516,27 +519,34 @@ end
 # `return is_same(old, new)` with static calls for every pair of the concrete `types`
 # for which `is_same` has a method (e.g. `Vector{Int}` and `Vector{Float64}`), and
 # `return false` for other values, like the fallback method of `is_same`
-function is_same_chain(old::Symbol, new::Symbol, types)
+function is_same_chain(old::Symbol, new::Symbol, types, name)
     types = filter(isconcretetype, collect(Type, types))
     outer = Any[]
+    pairs = 0
     for A in types
         inner = Any[]
         # same type first, it's the common case
         for B in sort(types; by = B -> B !== A)
             has_is_same_method(A, B) || continue
+            pairs += A !== B
             push!(inner, :($new isa $B) => :(return ComputePipeline.is_same($old::$A, $new::$B)))
         end
         push!(outer, :($old isa $A) => isa_chain(inner, :(return false)))
     end
+    if pairs > MAX_IS_SAME_PAIRS
+        @warn "StaticDispatch: $name compares $pairs pairs of different value types ($(length(types)) types)"
+    end
     return isa_chain(outer, :(return false))
 end
+# Above this number of pairs of different types in one `is_same` chain, `install!` warns
+const MAX_IS_SAME_PAIRS = 64
 
 function is_same_input_method(shapes::Shapes)
     # Values of other types are "not the same", i.e. the input updates
     return :(
         function ComputePipeline.is_same_input_value(input::Input{ComputeGraph}, @nospecialize(value))
             old = input.value
-            $(is_same_chain(:old, :value, shapes.input_value_types))
+            $(is_same_chain(:old, :value, shapes.input_value_types, "is_same_input_value"))
         end
     )
 end
@@ -550,7 +560,7 @@ function is_same_cached_methods(shapes::Shapes)
             methods, :(
                 function ComputePipeline.is_same_cached(ref::$R, @nospecialize(new))
                     old = ref[]
-                    $(is_same_chain(:old, :new, isnothing(members) ? Vs : members))
+                    $(is_same_chain(:old, :new, isnothing(members) ? Vs : members, "is_same_cached(::$R)"))
                 end
             )
         )
@@ -647,13 +657,13 @@ function generate(shapes::Shapes)
 end
 generate(roots...; kwargs...) = generate(collect_shapes(roots...; kwargs...))
 
-# Methods added by `install!`. `install!`/`uninstall!` are meant to be called at
-# build time, but they take `INSTALL_LOCK` so concurrent calls can't interleave.
-# Lock order: `INSTALL_LOCK` is only held while methods are evaluated or deleted,
-# never while taking a graph lock (`lock_for`) or running graph code (callbacks,
-# Observable listeners), and `isinstalled` reads `IS_INSTALLED` without locking.
-# So a callback running under a graph lock can't wait on `INSTALL_LOCK` while
-# `install!` holds it and waits on the graph lock.
+# Methods added by `install!`. `install!`/`uninstall!` are build-time operations
+# which require that no other task uses graphs meanwhile (see `install!`).
+# `INSTALL_LOCK` only keeps concurrent `install!`/`uninstall!` calls from
+# interleaving. It is only held while methods are evaluated or deleted, never while
+# taking a graph lock (`lock_for`) or running graph code (`prepare!` may run
+# callbacks and Observable listeners), and `isinstalled` reads `IS_INSTALLED`
+# without locking, so graph code never waits on `INSTALL_LOCK`.
 const INSTALLED = Method[]
 const INSTALL_LOCK = ReentrantLock()
 const IS_INSTALLED = Threads.Atomic{Bool}(false)
@@ -674,9 +684,18 @@ share as inputs (`add_input!(graph, key, ::Observable)`). An Observable from
 feeds, in both directions. Observables derived from these with `map` or
 `connect!` are not followed.
 
-`install!` collects the types without holding its own lock (resolving nodes in
-[`prepare!`](@ref) may run callbacks), so it may be called while other tasks
-resolve graphs, and [`isinstalled`](@ref) does not lock.
+`install!` and [`uninstall!`](@ref) are build-time operations: while they run,
+no other task may update, resolve, build or modify any `ComputeGraph` (including
+`get_observable!` and updates through Observables). `install!` reads the graphs
+before it evaluates the methods, and the methods are added one at a time, so a
+concurrent update could change types in between or run with only some of the
+methods installed. This is not checked. Callbacks run by `install!` itself (when
+[`prepare!`](@ref) resolves nodes) may call [`isinstalled`](@ref), which does not lock.
+
+Values of different types which `is_same` compares with a method other than its
+`false` fallback (e.g. `Vector{Int}` and `Vector{Float64}`) get one branch per
+pair, so these grow quadratically with the number of such types. A warning is
+shown above $(MAX_IS_SAME_PAIRS) pairs in one method.
 
 Call this once, after all graphs are built and resolved, before compiling. The
 graphs keep working natively afterwards, but throw a [`StaticDispatchError`](@ref)
@@ -690,6 +709,7 @@ edge modification API) is not seen by the installed methods.
 function install!(roots...; mod::Module = StaticDispatch, kwargs...)
     check_not_installed()
     # without `INSTALL_LOCK`: this takes the graph lock and may run callbacks
+    # (precondition: no other task uses the graphs until `install!` returns)
     shapes = collect_shapes(roots...; kwargs...)
     defs = generate(shapes).args
     @lock INSTALL_LOCK begin
@@ -743,7 +763,8 @@ end
 
 Removes the methods added by [`install!`](@ref), returning to the dynamic
 behaviour. Mainly meant for tests and interactive use; it relies on
-`Base.delete_method`, which is internal to Julia.
+`Base.delete_method`, which is internal to Julia. Like `install!`, it requires
+that no other task uses graphs while it runs.
 """
 function uninstall!()
     @lock INSTALL_LOCK begin

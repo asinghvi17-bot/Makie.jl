@@ -604,7 +604,6 @@ function get_observable!(attr::ComputeGraph, key::Symbol; use_deepcopy = true)
     # This requires us to copy data every time we update and we can't use
     # `copy` because that is not always available (e.g. not for Rect)
     return get!(attr.observables, key) do
-        isempty(attr.observables) && register_observable_graph!(attr)
         if use_deepcopy
             push!(attr.should_deepcopy, key)
         end
@@ -615,25 +614,6 @@ function get_observable!(attr::ComputeGraph, key::Symbol; use_deepcopy = true)
         # not updated in-place, so it's useless to add it here
         return Observable{eltype(val.value)}(initial_value)
     end
-end
-
-# Graphs which created observables with `get_observable!`, held weakly. Lets
-# `StaticDispatch` find the graph producing an Observable another graph consumes,
-# since the Observable has no reference to it.
-const OBSERVABLE_GRAPHS = WeakRef[]
-const OBSERVABLE_GRAPHS_LOCK = ReentrantLock()
-# length at which dead entries are removed next
-const OBSERVABLE_GRAPHS_PRUNE_AT = RefValue(64)
-
-function register_observable_graph!(graph::ComputeGraph)
-    @lock OBSERVABLE_GRAPHS_LOCK begin
-        push!(OBSERVABLE_GRAPHS, WeakRef(graph))
-        if length(OBSERVABLE_GRAPHS) >= OBSERVABLE_GRAPHS_PRUNE_AT[]
-            filter!(ref -> !isnothing(ref.value), OBSERVABLE_GRAPHS)
-            OBSERVABLE_GRAPHS_PRUNE_AT[] = max(64, 2 * length(OBSERVABLE_GRAPHS))
-        end
-    end
-    return
 end
 
 function get_observable!(c::Computed; use_deepcopy = true)
@@ -662,8 +642,30 @@ function ComputeGraph()
     )
 
     on(GraphObservablesUpdater(graph), graph.onchange)
+    register_graph!(graph)
 
     return graph
+end
+
+# Every `ComputeGraph`, held weakly and registered once at construction. Lets
+# `StaticDispatch` find the graph which created an Observable (`get_observable!`)
+# fed into another graph, since the Observable has no reference to it. Dead
+# entries are removed whenever the length doubled since the last pruning, so this
+# holds at most about twice the peak number of live graphs.
+const GRAPH_REGISTRY = WeakRef[]
+const GRAPH_REGISTRY_LOCK = ReentrantLock()
+# length at which dead entries are removed next
+const GRAPH_REGISTRY_PRUNE_AT = RefValue(64)
+
+function register_graph!(graph::ComputeGraph)
+    @lock GRAPH_REGISTRY_LOCK begin
+        push!(GRAPH_REGISTRY, WeakRef(graph))
+        if length(GRAPH_REGISTRY) >= GRAPH_REGISTRY_PRUNE_AT[]
+            filter!(ref -> !isnothing(ref.value), GRAPH_REGISTRY)
+            GRAPH_REGISTRY_PRUNE_AT[] = max(64, 2 * length(GRAPH_REGISTRY))
+        end
+    end
+    return
 end
 
 # Listener of `graph.onchange` which updates `graph.observables`
