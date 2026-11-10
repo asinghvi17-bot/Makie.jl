@@ -140,14 +140,23 @@ before `install!`, tracking stays on until `untrack!()` is called.
 The second form records the graphs built while `f()` runs (call `install!` in
 `f`) and always stops tracking and forgets them when `f` returns or throws.
 Returns the result of `f()`.
+
+Tracking sessions can't be nested: both forms throw an error if tracking is
+already on, without changing the running session. Use one session per `install!`.
 """
 function track_graphs!()
-    @lock ComputePipeline.TRACKED_GRAPHS_LOCK ComputePipeline.TRACK_GRAPHS[] = true
+    @lock ComputePipeline.TRACKED_GRAPHS_LOCK begin
+        ComputePipeline.TRACK_GRAPHS[] && error(
+            "StaticDispatch: graphs are already being tracked. Tracking sessions can't be nested; " *
+                "use one session per `install!` (or call `untrack!()` to end the running one)."
+        )
+        ComputePipeline.TRACK_GRAPHS[] = true
+    end
     return
 end
 
 function track_graphs!(f)
-    track_graphs!()
+    track_graphs!() # throws before the `try` if tracking is on, keeping that session
     try
         return f()
     finally
@@ -772,6 +781,7 @@ Typical build-time use: in a `track_graphs!() do ... end` block, build the graph
 (e.g. a scene) and call `install!(roots...)`; then compile. A successful
 `install!` stops tracking and forgets the recorded graphs (like [`untrack!`](@ref)).
 Without the block, a failed build leaves tracking on until `untrack!()` is called.
+Tracking sessions can't be nested (`track_graphs!` throws if tracking is on).
 
 `install!` and [`uninstall!`](@ref) are build-time operations: while they run,
 no other task may update, resolve, build or modify any `ComputeGraph` (including

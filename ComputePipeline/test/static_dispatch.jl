@@ -328,6 +328,24 @@ end
     @test isempty(ComputePipeline.TRACKED_GRAPHS)
 end
 
+@testset "track_graphs! can't be nested" begin
+    StaticDispatch.track_graphs!() do
+        outer = ComputeGraph()
+        inner_ran = Ref(false)
+        @test_throws ErrorException StaticDispatch.track_graphs!(() -> (inner_ran[] = true))
+        @test_throws ErrorException StaticDispatch.track_graphs!()
+        @test !inner_ran[]
+        # the outer session is intact
+        @test StaticDispatch.istracking()
+        @test length(ComputePipeline.TRACKED_GRAPHS) == 1
+        @test ComputePipeline.TRACKED_GRAPHS[1] === outer
+        ComputeGraph()
+        @test length(ComputePipeline.TRACKED_GRAPHS) == 2
+    end
+    @test !StaticDispatch.istracking()
+    @test isempty(ComputePipeline.TRACKED_GRAPHS)
+end
+
 @testset "tracking stopped while a graph is constructed" begin
     # A constructor which read `TRACK_GRAPHS[] == true` and continues after
     # `untrack!()` re-checks the flag under the lock and does not add its graph.
