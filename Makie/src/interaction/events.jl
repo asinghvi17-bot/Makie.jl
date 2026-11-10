@@ -329,7 +329,12 @@ end
 # Every other collection (e.g. of a custom button type, or a `Union` of element types) goes to
 # `_ispressed_collection_fallback`, which iterates it as usual. That is the one dynamic point left: it is fine
 # natively, and a static build can't compile it and replaces it. WasmCompat's Makie extension makes it throw an
-# `ArgumentError` for a Wasm build. Checked with a strict WasmCodegen compile (verify = :error, trim = :safe).
+# `ArgumentError` for a Wasm build (an empty collection is still `true`). Checked with a strict WasmCodegen compile
+# (verify = :error, trim = :safe).
+#
+# `_COLLECTION_ELTYPES` is internal: it is not part of the API and may change. The element types only make the
+# iteration of the collection itself static. The elements of a `Vector{Any}` or `Vector{BooleanOperator}` can still be
+# nested or custom values that need dispatch a static build can't compile.
 const _COLLECTION_ELTYPES = let buttons = (Keyboard.Button, Mouse.Button)
     (
         buttons..., Enum{Int32}, Union{buttons...}, Bool, Any, BooleanOperator, Exclusively,
@@ -347,8 +352,10 @@ end
     return _ispressed_collection_fallback(parent, x, waspressed)
 end
 
-# The collections that are not one of `_COLLECTION_ELTYPES`. The single place with a dynamic call that static
-# compilation can't resolve, see above. Ahead-of-time builds may replace this method.
+# Internal. The collections that are not one of `_COLLECTION_ELTYPES`. The single place with a dynamic call that static
+# compilation can't resolve, see above. Ahead-of-time builds may replace this method. WasmCompat's Makie extension
+# (`WasmCompatMakieExt`) overlays it and depends on this name and the signature `(parent, x, waspressed)::Bool`: change
+# them together.
 function _ispressed_collection_fallback(parent, x, waspressed)::Bool
     return _all_ispressed(parent, x, waspressed)
 end
