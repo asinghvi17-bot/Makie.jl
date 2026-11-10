@@ -641,6 +641,88 @@ end
     end
 end
 
+# The calls in the optimized IR of `f(args...)` (in the current world) which are
+# not statically resolved to one method (`:call`), as `(function name, argument
+# types)`, and the signatures of statically resolved ones (`:invoke`), as `(function
+# name, specialization types)`
+function compiled_calls(f, sig::Type{<:Tuple})
+    ci = only(Base.code_typed(f, sig; optimize = true, world = Base.get_world_counter()))[1]
+    argtype(a) = a isa Core.SSAValue ? ci.ssavaluetypes[a.id] :
+        a isa Core.Argument ? ci.slottypes[a.n] : Core.Typeof(a)
+    dynamic = Tuple{Symbol, Vector{Any}}[]
+    static = Tuple{Symbol, Any}[]
+    for stmt in ci.code
+        stmt isa Expr || continue
+        if stmt.head === :call && stmt.args[1] isa GlobalRef
+            push!(dynamic, (stmt.args[1].name, Any[argtype(a) for a in stmt.args[2:end]]))
+        elseif stmt.head === :invoke
+            target = stmt.args[1]
+            mi = target isa Core.CodeInstance ? target.def : target
+            mi isa Core.MethodInstance && push!(static, (mi.def.name, mi.specTypes))
+        end
+    end
+    return dynamic, static
+end
+
+@testset "install! with an Any-typed Observable" begin
+    # the in-place update keeps the node dirty while the value stays equal, so
+    # whether the Observable notifies depends on `is_same(obs[], value)`
+    function any_observable_graph()
+        g = ComputeGraph()
+        add_input!(g, :x, 1.0)
+        register_computation!(g, [:x], [:y]) do inputs, changed, cached
+            v = isnothing(cached) ? [0.0] : cached.y
+            v[1] = floor(inputs.x)
+            return (v,)
+        end
+        ComputePipeline.set_type!(g.y, Any)
+        obs = ComputePipeline.get_observable!(g, :y)
+        notified = Ref(0)
+        on(_ -> notified[] += 1, obs)
+        g.x = 1.5 # resolve once more, so the TypedEdge exists
+        return g, obs, notified
+    end
+    function any_observable_updates!(g, obs, notified)
+        out = Any[]
+        for x in (1.2, 2.5, 2.7, 3.1, 3.9)
+            update!(g, :x => x)
+            push!(out, (copy(obs[]), notified[]))
+        end
+        return out
+    end
+
+    g, obs, notified = any_observable_graph()
+    @test obs isa Observable{Any}
+    reference = any_observable_updates!(g, obs, notified)
+    @test last.(reference) == [0, 1, 1, 2, 2] # equal values do not notify
+
+    g, obs, notified = any_observable_graph()
+    try
+        shapes = StaticDispatch.install!(g)
+        @test (typeof(obs), typeof(g.y.value)) in shapes.observables
+        @test @invokelatest(any_observable_updates!(g, obs, notified)) == reference
+        # no runtime dispatch on the abstract values in the installed methods
+        sig = Tuple{Observable{Any}, ComputePipeline.Computed, Bool}
+        dynamic, static = @invokelatest compiled_calls(ComputePipeline.sync_observable!, sig)
+        @test isdisjoint(first.(dynamic), [:sync_observable_value!, :is_same, :is_same_observable, :deepcopy])
+        watched = [:sync_observable_value!, :deepcopy, :is_same, :is_same_observable]
+        calls = [T for (name, T) in static if name in watched]
+        @test all(T -> all(isconcretetype, T.parameters[2:end]), calls) # not called with an abstract value
+        sig = Tuple{Observable{Any}, Any}
+        dynamic, _ = @invokelatest compiled_calls(ComputePipeline.is_same_observable, sig)
+        @test isdisjoint(first.(dynamic), [:is_same])
+        # value types not seen by `install!`
+        err = catch_error() do
+            @invokelatest ComputePipeline.sync_observable!(obs, g.y, true)
+            g.y.value[] = 1 # an Int instead of the Vector{Float64} seen
+            @invokelatest ComputePipeline.sync_observable!(obs, g.y, true)
+        end
+        @test err isa StaticDispatchError && err.kind === :observable
+    finally
+        StaticDispatch.uninstall!()
+    end
+end
+
 @testset "StaticDispatchError messages" begin
     graph = ComputeGraph()
     add_input!(graph, :a, 1.0)

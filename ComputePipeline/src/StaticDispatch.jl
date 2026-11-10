@@ -701,13 +701,45 @@ function select_method(shapes::Shapes)
     )
 end
 
+# The concrete value types a slot of `RefValue` type `R` may hold: its element type
+# if concrete, the members of a small Union, else the types seen at `install!`
+function slot_value_types(shapes::Shapes, R::Type)
+    T = eltype(R)
+    isconcretetype(T) && return Type[T]
+    members = union_members(T)
+    return isnothing(members) ? collect(Type, get(shapes.abstract_refs, R, Type[])) : collect(Type, members)
+end
+
+# `Observable{Any}` or `Observable{Union{...}}`
+observable_value_type(O::Type) = O.parameters[1]
+
 function observable_method(shapes::Shapes)
     branches = Any[]
+    expected = Tuple(shapes.observables)
     for (O, R) in shapes.observables
         cond = :(obs isa $O && node.value isa $R)
-        body = quote
-            ComputePipeline.resolve!(node)
-            return ComputePipeline.sync_observable_value!(obs::$O, (node.value::$R)[], use_deepcopy)
+        if isconcretetype(eltype(R))
+            body = quote
+                ComputePipeline.resolve!(node)
+                return ComputePipeline.sync_observable_value!(obs::$O, (node.value::$R)[], use_deepcopy)
+            end
+        else
+            # An abstractly typed value would make `deepcopy` and `is_same` dynamic:
+            # one branch per value type, like for cached values
+            value_branches = Any[
+                :(val isa $V) => :(return ComputePipeline.sync_observable_value!(obs::$O, val::$V, use_deepcopy))
+                    for V in slot_value_types(shapes, R)
+            ]
+            body = quote
+                ComputePipeline.resolve!(node)
+                val = (node.value::$R)[]
+                $(
+                    isa_chain(
+                        value_branches,
+                        fail(:observable, :(node.name), any_vector([:(typeof(obs)), :(typeof(val))]), expected)
+                    )
+                )
+            end
         end
         push!(branches, cond => body)
     end
@@ -716,11 +748,33 @@ function observable_method(shapes::Shapes)
             $(
                 isa_chain(
                     branches,
-                    fail(:observable, :(node.name), any_vector([:(typeof(obs)), :(typeof(node.value))]), Tuple(shapes.observables))
+                    fail(:observable, :(node.name), any_vector([:(typeof(obs)), :(typeof(node.value))]), expected)
                 )
             )
         end
     )
+end
+
+# `is_same(obs[], new)` of the Observables with an abstract value type has to branch
+# on the type of the old value (the type of a node value the Observable was fed with)
+function is_same_observable_methods(shapes::Shapes)
+    old_types = Dict{Type, Vector{Type}}()
+    for (O, R) in shapes.observables
+        isconcretetype(observable_value_type(O)) && continue
+        append!(get!(Vector{Type}, old_types, O), slot_value_types(shapes, R))
+    end
+    methods = Any[]
+    for (O, types) in old_types
+        push!(
+            methods, :(
+                function ComputePipeline.is_same_observable(obs::$O, @nospecialize(new))
+                    old = obs[]
+                    $(is_same_chain(:old, :new, unique(types), "is_same_observable(::$O)"))
+                end
+            )
+        )
+    end
+    return methods
 end
 
 """
@@ -738,6 +792,7 @@ function generate(shapes::Shapes)
         is_same_input_method(shapes),
         is_same_cached_methods(shapes)...,
         observable_method(shapes),
+        is_same_observable_methods(shapes)...,
         select_method(shapes),
         :(
             ComputePipeline.other_edge(f, @nospecialize(edge::AbstractEdge)) =
@@ -880,7 +935,8 @@ function installed_candidates()
     fs = (
         ComputePipeline.resolve_edge_callback!,
         ComputePipeline.update_input_output!, ComputePipeline.is_same_input_value,
-        ComputePipeline.is_same_cached, ComputePipeline.sync_observable!,
+        ComputePipeline.is_same_cached, ComputePipeline.is_same_observable,
+        ComputePipeline.sync_observable!,
         ComputePipeline.other_edge, ComputePipeline.resolve_exception,
         ComputePipeline.forward_selected!,
     )

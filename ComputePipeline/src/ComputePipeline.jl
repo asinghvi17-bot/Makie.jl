@@ -729,13 +729,16 @@ function sync_observable_value!(obs::Observable, val, use_deepcopy::Bool)
     if !use_deepcopy
         obs.val = val
         return true
-    elseif !is_same(obs[], val) # treat in-place updates (use isequal to handle NaN correctly)
+    elseif !is_same_observable(obs, val) # treat in-place updates (use isequal to handle NaN correctly)
         obs.val = deepcopy(val)
         return true
     else # same value (with deepcopy), skip update
         return false
     end
 end
+
+# Hook: called with `(::Observable{T}, ::S)`. Only dynamic if `T` is abstract.
+is_same_observable(obs::Observable, new) = is_same(obs[], new)
 
 """
     alias!(graph::ComputeGraph, input::Symbol, output::Symbol)
