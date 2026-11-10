@@ -2306,7 +2306,7 @@ function locked_resolve!(edge::TypedEdge{Inputs, Outputs, <:MapFunctionWrapper{p
         args = map(getindex, edge.inputs)
         _result = edge.callback.user_func(args...)
         result = pack ? (_result,) : _result
-        set_result!(edge, result)
+        set_result_narrowed!(edge, result)
     end
     return
 end
