@@ -311,6 +311,62 @@ end
     @test isempty(ComputePipeline.TRACKED_GRAPHS)
 end
 
+@testset "track_graphs! do-block" begin
+    graphs = StaticDispatch.track_graphs!() do
+        @test StaticDispatch.istracking()
+        return [ComputeGraph(), ComputeGraph()]
+    end
+    @test length(graphs) == 2
+    @test !StaticDispatch.istracking()
+    @test isempty(ComputePipeline.TRACKED_GRAPHS)
+    # stops tracking if building fails
+    @test_throws ErrorException StaticDispatch.track_graphs!() do
+        ComputeGraph()
+        error("build failed")
+    end
+    @test !StaticDispatch.istracking()
+    @test isempty(ComputePipeline.TRACKED_GRAPHS)
+end
+
+@testset "tracking stopped while a graph is constructed" begin
+    # A constructor which read `TRACK_GRAPHS[] == true` and continues after
+    # `untrack!()` re-checks the flag under the lock and does not add its graph.
+    StaticDispatch.track_graphs!()
+    graph = ComputeGraph()
+    @test length(ComputePipeline.TRACKED_GRAPHS) == 1
+    StaticDispatch.untrack!()
+    ComputePipeline.track_graph!(graph) # the rest of that constructor
+    @test isempty(ComputePipeline.TRACKED_GRAPHS)
+    # concurrent constructions while tracking stops leave nothing behind
+    for _ in 1:20
+        StaticDispatch.track_graphs!()
+        tasks = [Threads.@spawn(foreach(_ -> ComputeGraph(), 1:200)) for _ in 1:4]
+        StaticDispatch.untrack!()
+        foreach(wait, tasks)
+        @test isempty(ComputePipeline.TRACKED_GRAPHS)
+    end
+end
+
+@testset "install! warns about a producer built before tracking" begin
+    g1 = ComputeGraph()
+    add_input!(g1, :x, 1.0)
+    map!(x -> 2x, g1, :x, :y)
+    try
+        g2 = StaticDispatch.track_graphs!() do
+            g2 = ComputeGraph()
+            add_input!(g2, :y, ComputePipeline.get_observable!(g1, :y))
+            map!(y -> y + 1, g2, :y, :z)
+            g2.z[]
+            shapes = @test_logs (:warn, r"the inputs y are fed by Observables which no graph") StaticDispatch.install!(g2)
+            @test length(shapes.graphs) == 1
+            return g2
+        end
+        @test !StaticDispatch.istracking()
+    finally
+        StaticDispatch.uninstall!()
+    end
+end
+
 @testset "is_same pairs warning" begin
     types = [Vector{T} for T in (Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64, Float64)]
     @test_logs (:warn, r"72 pairs of different value types") StaticDispatch.is_same_chain(:a, :b, types, "test")

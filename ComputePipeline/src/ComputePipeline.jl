@@ -655,8 +655,10 @@ const TRACK_GRAPHS = Threads.Atomic{Bool}(false)
 const TRACKED_GRAPHS = ComputeGraph[]
 const TRACKED_GRAPHS_LOCK = ReentrantLock()
 
+# The flag is only changed under `TRACKED_GRAPHS_LOCK`, so re-checking it under the
+# lock keeps a constructor which saw `true` from adding a graph after tracking stopped
 @noinline function track_graph!(graph::ComputeGraph)
-    @lock TRACKED_GRAPHS_LOCK push!(TRACKED_GRAPHS, graph)
+    @lock TRACKED_GRAPHS_LOCK TRACK_GRAPHS[] && push!(TRACKED_GRAPHS, graph)
     return
 end
 
