@@ -282,34 +282,49 @@ of it's current state. For example, when reacting to a mousebutton event, you ca
 pass `event.button` so that a key combination including that button still evaluates
 as true.
 
+Methods can be added to `ispressed` for other types of buttons, which then
+can also be used inside operators and collections. They need to accept the
+`waspressed` argument. Buttons, operators and collections of the types above are
+always evaluated by the method defined by Makie.
+
 See also: [`And`](@ref), [`Or`](@ref), [`Not`](@ref), [`Exclusively`](@ref),
 `&`, `|`, `!`
 """
 function ispressed(parent, x, waspressed = nothing)
-    return _ispressed(parent, x, waspressed)::Bool
+    return _ispressed(parent, x, waspressed, false)::Bool
 end
 
-# `ispressed` is deliberately one method which branches on the closed set of input types (`IsPressedInputType`) with
+# `ispressed` is deliberately one method which branches on the supported input types (`IsPressedInputType`) with
 # `isa`, instead of one method per type. The button usually reaches a call site as a `Union` of all of them
 # (e.g. `Observable{IsPressedInputType}`) or as `Any` (attributes), so inference sees every `ispressed` method as a
 # candidate. That is a dynamic dispatch, which static compilation (juliac `--trim=safe`) cannot resolve. A single
 # method resolves for any argument type.
-function _ispressed(parent, x, waspressed)::Bool
+#
+# `nested` is false for the call from `ispressed` itself and true for the elements of operators and collections.
+# Those go through `ispressed` again if they are not one of the supported types, so that methods added to `ispressed`
+# for other types keep working inside operators and collections. For the supported types this branch is never
+# reached, and since `ispressed` is then still a single method it is also a statically resolved call.
+function _ispressed(parent, x, waspressed, nested::Bool)::Bool
     x isa Bool && return x
     x isa Keyboard.Button && return x in _events(parent).keyboardstate || x == waspressed
     x isa Mouse.Button && return x in _events(parent).mousebuttonstate || x == waspressed
     # Boolean Operator evaluation
-    x isa And && return _ispressed(parent, x.left, waspressed) && _ispressed(parent, x.right, waspressed)
-    x isa Or && return _ispressed(parent, x.left, waspressed) || _ispressed(parent, x.right, waspressed)
-    x isa Not && return !_ispressed(parent, x.x, waspressed)
+    x isa And && return _ispressed(parent, x.left, waspressed, true) && _ispressed(parent, x.right, waspressed, true)
+    x isa Or && return _ispressed(parent, x.left, waspressed, true) || _ispressed(parent, x.right, waspressed, true)
+    x isa Not && return !_ispressed(parent, x.x, waspressed, true)
     x isa Exclusively && return _ispressed_exclusively(_events(parent), x, waspressed)
     x isa Tuple && return _all_ispressed(parent, x, waspressed)
-    return _ispressed_collection(parent, x, waspressed)
+    x isa Union{Vector, Set} && return _ispressed_collection(parent, x, waspressed)
+    nested && return ispressed(parent, x, waspressed)::Bool
+    throw(ArgumentError("`ispressed` is not defined for $(typeof(x)), see `IsPressedInputType` for the supported types."))
 end
 
-# Vectors and Sets are only iterable (statically compiled, in Wasm) with a concrete element type. These are the ones
-# that occur for a collection of buttons: `Set((Keyboard.a, Mouse.left))` is a `Set{Enum{Int32}}`, `[a & b, c | d]`
-# a `Vector{BooleanOperator}`, and `Any` covers everything else.
+# Iterating a Vector or Set is statically compiled (juliac `--trim`, Wasm) only with a concrete element type. These
+# are the ones that occur for a collection of buttons: `Set((Keyboard.a, Mouse.left))` is a `Set{Enum{Int32}}`,
+# `[a & b, c | d]` a `Vector{BooleanOperator}`, and `Any` is what an untyped literal gives. Every other element type
+# (`[a & b]` is a `Vector{And{Keyboard.Button, Mouse.Button}}`, `Union`s, empty collections, ...) is iterated the same
+# way, element by element, but when the type of the collection is not known where `ispressed` is called (e.g. it comes
+# from an `Any`), the call to `_all_ispressed` for it is a dynamic dispatch.
 const _COLLECTION_ELTYPES = (
     Keyboard.Button, Mouse.Button, Enum{Int32}, Union{Keyboard.Button, Mouse.Button}, BooleanOperator, Bool, Any,
 )
@@ -320,7 +335,7 @@ const _COLLECTION_ELTYPES = (
                 for C in (Vector, Set) for T in _COLLECTION_ELTYPES
         )...
     )
-    throw(ArgumentError("`ispressed` is not defined for this type of button, see `IsPressedInputType`."))
+    return _all_ispressed(parent, x, waspressed)
 end
 
 _events(e::Events) = e
@@ -350,7 +365,7 @@ end
 
 function _all_ispressed(parent, collection, waspressed)::Bool
     for x in collection
-        _ispressed(parent, x, waspressed) || return false
+        _ispressed(parent, x, waspressed, true) || return false
     end
     return true
 end
