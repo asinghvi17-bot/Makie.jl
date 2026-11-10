@@ -406,3 +406,46 @@ end
         test_plot(dendrogram, ps, [(i, i + 1) for i in 1:2:13], dims = ((1, 2),))
     end
 end
+
+@testset "Empty points with components of different types" begin
+    d = Date(2020, 1, 1)
+    # the empty components are numbers (of the type of the components if it is a number, or Float64)
+    empty_dim_value(points, i) = Makie.convert_dim_value(nothing, nothing, points, nothing, i)
+    for (points, T1, T2) in (
+            (Tuple{Date, Float64}[], Float64, Float64),
+            (Tuple{Float64, Date}[], Float64, Float64),
+            (Tuple{Int, Float64}[], Float64, Float64),
+            (Tuple{Date, DateTime}[], Float64, Float64),
+            (Point2f[], Float32, Float32),
+            (Point{3, Int}[], Int, Int),
+            (Vec2d[], Float64, Float64),
+            (NTuple{2, Float32}[], Float32, Float32),
+        )
+        @test typeof(empty_dim_value(points, 1)) == Vector{T1}
+        @test typeof(empty_dim_value(points, 2)) == Vector{T2}
+        @test only(Base.return_types(Makie.empty_dim_value, Tuple{Type{eltype(eltype(points))}})) == Vector{T1}
+    end
+
+    # an observable of such points, which becomes empty and non-empty again
+    ps = Tuple{Date, Float64}[(d, 1.0), (d + Day(1), 2.0)]
+    for plotfunc in (scatter!, lines!, scatterlines!)
+        points = Observable(ps)
+        f = Figure()
+        ax = Axis(f[1, 1])
+        plot = plotfunc(ax, points)
+        @test plot.positions[] isa Vector{Point2{Float64}}
+        @test length(plot.positions[]) == 2
+        for value in (Tuple{Date, Float64}[], ps, Tuple{Date, Float64}[])
+            points[] = value
+            @test plot.positions[] isa Vector{Point2{Float64}}
+            @test length(plot.positions[]) == length(value)
+            # (numeric points, not Point{2, Any})
+            @test plot.attributes[:dim_converted][] isa Tuple{Vector{<:Point2{<:Real}}}
+        end
+    end
+    # a plot of no points to begin with (which has no dim conversion to update when it gets some)
+    for T in (Tuple{Float64, Date}, Tuple{Date, Float64})
+        f, ax, plot = lines(Observable(T[]))
+        @test plot.positions[] isa Vector{Point2{Float64}} && isempty(plot.positions[])
+    end
+end

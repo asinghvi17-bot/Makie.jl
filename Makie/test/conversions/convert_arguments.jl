@@ -597,6 +597,30 @@ end
     @test typeof(empty_mesh) == typeof(convert_arguments(Makie.Mesh, [m2, m2])[1])
     @test isempty(faces(convert_arguments(Makie.Mesh, GeometryBasics.AbstractGeometry{2}[])[1]))
 
+    # attributes backed by views and ranges (which cannot be constructed empty) are collected into vectors,
+    # for one mesh as well as for more, and for none
+    cols = [RGBAf(1, 0, 0, 1), RGBAf(0, 1, 0, 1), RGBAf(0, 0, 1, 1)]
+    tri = Point2f[(0, 0), (1, 0), (1, 1)]
+    for attr in (view(cols, :), 1:3, view(cols, 1:3))
+        mv = GeometryBasics.Mesh(tri, GLTriangleFace[(1, 2, 3)]; color = attr)
+        @test !(typeof(vertex_attributes(mv).color) <: Vector)
+        empty_mesh = convert_arguments(Makie.Mesh, typeof(mv)[])[1]
+        @test isempty(faces(empty_mesh)) && isempty(coordinates(empty_mesh)) && isempty(empty_mesh.color)
+        for ms in ([mv], [mv, mv], [mv, mv, mv])
+            @test is_concrete(typeof(ms))
+            merged = convert_arguments(Makie.Mesh, ms)[1]
+            @test typeof(merged) == typeof(empty_mesh)
+            @test length(coordinates(merged)) == 3length(ms)
+            @test collect(merged.color) == repeat(collect(attr), length(ms))
+        end
+        # (a vector of meshes with attributes that are already vectors is merged as before)
+        @test convert_arguments(Makie.Mesh, [mv, mv])[1].color isa Vector
+    end
+    # a single mesh with vectors for attributes is not copied
+    mc = GeometryBasics.Mesh(tri, GLTriangleFace[(1, 2, 3)]; color = cols)
+    @test convert_arguments(Makie.Mesh, [mc])[1].color === cols
+    @test convert_arguments(Makie.Mesh, [mc])[1] == convert_arguments(Makie.Mesh, mc)[1]
+
     # the outline of polygons
     pol = Polygon(Point2d[(0, 0), (4, 0), (4, 4), (0, 4)], [Point2d[(1, 1), (2, 1), (2, 2)]])
     mpol = MultiPolygon([pol, pol])
