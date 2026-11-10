@@ -1841,3 +1841,52 @@ end
     graph.x = 7.0
     @test_throws ResolveException graph.y[]
 end
+
+@testset "Typed resolve of a multi-output map! returning Any" begin
+    # `holder[1]` is inferred as `Any`, so the specialized `MapFunctionWrapper`
+    # path must narrow the result itself instead of dispatching on it at runtime
+    holder = Any[(1.0, 2)]
+    graph = ComputeGraph()
+    add_input!(graph, :x, 1.0)
+    map!(graph, :x, [:a, :b]) do x
+        return holder[1]
+    end
+    @test graph.a[] == 1.0 # dynamic first resolve
+    holder[1] = (2.0, 3)
+    graph.x = 2.0
+    @test (graph.a[], graph.b[]) == (2.0, 3) # builds the TypedEdge
+    edge = graph.a.parent
+    @test isassigned(edge.typed_edge)
+    te = edge.typed_edge[]
+    @test te.callback isa ComputePipeline.MapFunctionWrapper{false}
+
+    @test only(Base.return_types(te.callback.user_func, Tuple{Float64})) === Any
+    function untyped_set_result_calls(f, sig)
+        ci = only(Base.code_typed(f, sig; optimize = true))[1]
+        argtype(a) = a isa Core.SSAValue ? ci.ssavaluetypes[a.id] :
+            a isa Core.Argument ? ci.slottypes[a.n] : Core.Typeof(a)
+        return count(ci.code) do stmt
+            stmt isa Expr && stmt.head === :call && stmt.args[1] isa GlobalRef &&
+                stmt.args[1].name === :set_result! && argtype(stmt.args[3]) === Any
+        end
+    end
+    @test untyped_set_result_calls(ComputePipeline.locked_resolve!, Tuple{typeof(te)}) == 0
+
+    # every kind of result still takes the same path as before
+    holder[1] = (4.0, 5)
+    graph.x = 3.0
+    @test (graph.a[], graph.b[]) == (4.0, 5)
+    holder[1] = ComputePipeline.skip_update
+    graph.x = 4.0
+    @test (graph.a[], graph.b[]) == (4.0, 5)
+    @test !graph.a.dirty
+    holder[1] = (6.0, 7)
+    graph.x = 5.0
+    @test (graph.a[], graph.b[]) == (6.0, 7)
+    holder[1] = (1.0,)
+    graph.x = 6.0
+    @test_throws ResolveException graph.a[]
+    holder[1] = 1
+    graph.x = 7.0
+    @test_throws ResolveException graph.a[]
+end
