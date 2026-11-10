@@ -1,8 +1,15 @@
 # A pure Julia port of mapbox's earcut polygon triangulation, following earcut.hpp v2.2.4
 # (https://github.com/mapbox/earcut.hpp, the C++ port of https://github.com/mapbox/earcut), which is what
 # `libearcut` (EarCut_jll, called by `GeometryBasics.earcut_triangulate`) is built from. The triangles come out
-# in the same order, with the same vertex order, as `libearcut`'s. It is plain Julia so that it compiles
-# ahead of time (e.g. to Wasm) where the `ccall` into `libearcut` cannot.
+# in the same order, with the same vertex order, as `libearcut`'s (tested on a corpus of random, degenerate and
+# recipe-shaped polygons, see test/isolated/earcut.jl), except for the order of holes that have the same leftmost x
+# when there are more than 16 of them: earcut sorts the holes by that x, and `std::sort` (libstdc++, an introsort for
+# more than 16 elements) may put equal ones in another order than the stable sort here. The result is then another
+# triangulation of the same polygon. It is plain Julia so that it compiles ahead of time (e.g. to Wasm) where the
+# `ccall` into `libearcut` cannot, and it is also faster than that `ccall` from Julia (see the changelog).
+#
+# Besides that, ring-only polygons that are strictly convex (the rectangles of `barplot` and `hist`) take a shortcut,
+# `ec_triangulate_convex`, which clips the ears like the general code does but without building the linked lists.
 #
 # Copyright (c) 2015, Mapbox
 #
@@ -31,7 +38,7 @@ mutable struct EarcutState
     prevz::Vector{Int}        # previous and next nodes in z-order
     nextz::Vector{Int}
     steiner::Vector{Bool}
-    indices::Vector{Int}      # the output: 3 0-based vertex indices per triangle
+    faces::Vector{GLTriangleFace}  # the output
     vertices::Int             # number of input vertices linked so far
     hashing::Bool
     minx::Float64
@@ -39,9 +46,30 @@ mutable struct EarcutState
     inv_size::Float64
 end
 
-EarcutState() = EarcutState(
-    Float64[], Float64[], Int[], Int[], Int[], Int32[], Int[], Int[], Bool[], Int[], 0, false, 0.0, 0.0, 0.0
-)
+# `nodes` is the number of nodes expected, `ntriangles` the number of triangles. The vectors are allocated for them once,
+# so that building the lists does not reallocate. The z-order fields are only needed (and only allocated) when hashing.
+function EarcutState(nodes::Int, ntriangles::Int, hashing::Bool)
+    alloc(::Type{T}) where {T} = sizehint!(T[], nodes)
+    zs = hashing ? nodes : 0
+    faces = sizehint!(GLTriangleFace[], ntriangles)
+    return EarcutState(
+        alloc(Float64),
+        alloc(Float64),
+        alloc(Int),
+        alloc(Int),
+        alloc(Int),
+        sizehint!(Int32[], zs),
+        sizehint!(Int[], zs),
+        sizehint!(Int[], zs),
+        alloc(Bool),
+        faces,
+        0,
+        hashing,
+        0.0,
+        0.0,
+        0.0,
+    )
+end
 
 # create a node and optionally link it with the previous one (in a circular doubly linked list)
 function ec_insert_node!(s::EarcutState, i::Int, x::Float64, y::Float64, last::Int)::Int
@@ -65,9 +93,11 @@ function ec_new_node!(s::EarcutState, i::Int, x::Float64, y::Float64)::Int
     push!(s.id, i)
     push!(s.prev, 0)
     push!(s.next, 0)
-    push!(s.z, Int32(0))
-    push!(s.prevz, 0)
-    push!(s.nextz, 0)
+    if s.hashing
+        push!(s.z, Int32(0))
+        push!(s.prevz, 0)
+        push!(s.nextz, 0)
+    end
     push!(s.steiner, false)
     return length(s.x)
 end
@@ -75,8 +105,10 @@ end
 function ec_remove_node!(s::EarcutState, p::Int)::Nothing
     s.next[s.prev[p]] = s.next[p]
     s.prev[s.next[p]] = s.prev[p]
-    s.prevz[p] != 0 && (s.nextz[s.prevz[p]] = s.nextz[p])
-    s.nextz[p] != 0 && (s.prevz[s.nextz[p]] = s.prevz[p])
+    if s.hashing
+        s.prevz[p] != 0 && (s.nextz[s.prevz[p]] = s.nextz[p])
+        s.nextz[p] != 0 && (s.prevz[s.nextz[p]] = s.prevz[p])
+    end
     return nothing
 end
 
@@ -152,7 +184,7 @@ function ec_earcut_linked!(s::EarcutState, ear::Int, pass::Int = 0)::Nothing
 
         if s.hashing ? ec_is_ear_hashed(s, ear) : ec_is_ear(s, ear)
             # cut off the triangle
-            push!(s.indices, s.id[prev], s.id[ear], s.id[next])
+            push!(s.faces, GLTriangleFace(s.id[prev] + 1, s.id[ear] + 1, s.id[next] + 1))
 
             ec_remove_node!(s, ear)
 
@@ -223,7 +255,8 @@ function ec_is_ear_hashed(s::EarcutState, ear::Int)::Bool
     # first look for points inside the triangle in increasing z-order
     p = s.nextz[ear]
     while p != 0 && s.z[p] <= max_z
-        if p != s.prev[ear] && p != s.next[ear] &&
+        if p != s.prev[ear] &&
+                p != s.next[ear] &&
                 ec_point_in_triangle(s.x[a], s.y[a], s.x[b], s.y[b], s.x[c], s.y[c], s.x[p], s.y[p]) &&
                 ec_area(s, s.prev[p], p, s.next[p]) >= 0
             return false
@@ -234,7 +267,8 @@ function ec_is_ear_hashed(s::EarcutState, ear::Int)::Bool
     # then look for points in decreasing z-order
     p = s.prevz[ear]
     while p != 0 && s.z[p] >= min_z
-        if p != s.prev[ear] && p != s.next[ear] &&
+        if p != s.prev[ear] &&
+                p != s.next[ear] &&
                 ec_point_in_triangle(s.x[a], s.y[a], s.x[b], s.y[b], s.x[c], s.y[c], s.x[p], s.y[p]) &&
                 ec_area(s, s.prev[p], p, s.next[p]) >= 0
             return false
@@ -252,8 +286,11 @@ function ec_cure_local_intersections!(s::EarcutState, start::Int)::Int
         b = s.next[s.next[p]]
 
         # a self-intersection where edge (v[i-1],v[i]) intersects (v[i+1],v[i+2])
-        if !ec_equals(s, a, b) && ec_intersects(s, a, p, s.next[p], b) && ec_locally_inside(s, a, b) && ec_locally_inside(s, b, a)
-            push!(s.indices, s.id[a], s.id[p], s.id[b])
+        if !ec_equals(s, a, b) &&
+                ec_intersects(s, a, p, s.next[p], b) &&
+                ec_locally_inside(s, a, b) &&
+                ec_locally_inside(s, b, a)
+            push!(s.faces, GLTriangleFace(s.id[a] + 1, s.id[p] + 1, s.id[b] + 1))
 
             # remove two nodes involved
             ec_remove_node!(s, p)
@@ -297,7 +334,7 @@ end
 
 # link every hole into the outer loop, producing a single-ring polygon without holes
 function ec_eliminate_holes!(s::EarcutState, rings, outer::Int)::Int
-    queue = Int[]
+    queue = sizehint!(Int[], length(rings) - 1)
     for i in 2:length(rings)
         list = ec_linked_list!(s, rings[i], false)
         if list != 0
@@ -306,16 +343,9 @@ function ec_eliminate_holes!(s::EarcutState, rings, outer::Int)::Int
         end
     end
 
-    # (a stable insertion sort by x: libstdc++'s `std::sort` on few elements)
-    for i in 2:length(queue)
-        v = queue[i]
-        j = i - 1
-        while j >= 1 && s.x[v] < s.x[queue[j]]
-            queue[j + 1] = queue[j]
-            j -= 1
-        end
-        queue[j + 1] = v
-    end
+    # By x only: the order of holes with the same leftmost x is that of a stable sort (the same as `std::sort`
+    # of libstdc++ for up to 16 holes, which is an insertion sort there; its introsort may order ties differently).
+    sort!(queue; by = i -> s.x[i], alg = Base.Sort.MergeSort)
 
     # process holes from left to right
     for hole in queue
@@ -374,12 +404,16 @@ function ec_find_hole_bridge(s::EarcutState, hole::Int, outer::Int)::Int
     my = s.y[m]
 
     while true
-        if hx >= s.x[p] && s.x[p] >= mx && hx != s.x[p] &&
+        if hx >= s.x[p] &&
+                s.x[p] >= mx &&
+                hx != s.x[p] &&
                 ec_point_in_triangle(hy < my ? hx : qx, hy, mx, my, hy < my ? qx : hx, hy, s.x[p], s.y[p])
             tan_cur = abs(hy - s.y[p]) / (hx - s.x[p]) # tangential
 
-            if ec_locally_inside(s, p, hole) &&
-                    (tan_cur < tan_min || (tan_cur == tan_min && (s.x[p] > s.x[m] || ec_sector_contains_sector(s, m, p))))
+            if ec_locally_inside(s, p, hole) && (
+                    tan_cur < tan_min ||
+                        (tan_cur == tan_min && (s.x[p] > s.x[m] || ec_sector_contains_sector(s, m, p)))
+                )
                 m = p
                 tan_min = tan_cur
             end
@@ -473,7 +507,7 @@ function ec_sort_linked!(s::EarcutState, list::Int)::Int
 
         insize *= 2
     end
-    return
+    return nothing
 end
 
 # z-order of a point given coords and size of the data bounding box
@@ -510,7 +544,9 @@ function ec_get_leftmost(s::EarcutState, start::Int)::Int
 end
 
 # check if a point lies within a convex triangle
-function ec_point_in_triangle(ax::Float64, ay::Float64, bx::Float64, by::Float64, cx::Float64, cy::Float64, px::Float64, py::Float64)::Bool
+function ec_point_in_triangle(
+        ax::Float64, ay::Float64, bx::Float64, by::Float64, cx::Float64, cy::Float64, px::Float64, py::Float64
+    )::Bool
     return (cx - px) * (ay - py) >= (ax - px) * (cy - py) &&
         (ax - px) * (by - py) >= (bx - px) * (ay - py) &&
         (bx - px) * (cy - py) >= (cx - px) * (by - py)
@@ -518,13 +554,20 @@ end
 
 # check if a diagonal between two polygon nodes is valid (lies in polygon interior)
 function ec_is_valid_diagonal(s::EarcutState, a::Int, b::Int)::Bool
-    return s.id[s.next[a]] != s.id[b] && s.id[s.prev[a]] != s.id[b] && !ec_intersects_polygon(s, a, b) && # doesn't intersect other edges
+    return s.id[s.next[a]] != s.id[b] &&
+        s.id[s.prev[a]] != s.id[b] &&
+        !ec_intersects_polygon(s, a, b) && # doesn't intersect other edges
         (
         (
-            ec_locally_inside(s, a, b) && ec_locally_inside(s, b, a) && ec_middle_inside(s, a, b) && # locally visible
+            ec_locally_inside(s, a, b) &&
+                ec_locally_inside(s, b, a) &&
+                ec_middle_inside(s, a, b) && # locally visible
                 (ec_area(s, s.prev[a], a, s.prev[b]) != 0.0 || ec_area(s, a, s.prev[b], b) != 0.0) # does not create opposite-facing sectors
-        ) ||
-            (ec_equals(s, a, b) && ec_area(s, s.prev[a], a, s.next[a]) > 0 && ec_area(s, s.prev[b], b, s.next[b]) > 0)
+        ) || (
+            ec_equals(s, a, b) &&
+                ec_area(s, s.prev[a], a, s.next[a]) > 0 &&
+                ec_area(s, s.prev[b], b, s.next[b]) > 0
+        )
     ) # special zero-length case
 end
 
@@ -568,7 +611,10 @@ function ec_intersects_polygon(s::EarcutState, a::Int, b::Int)::Bool
     p = a
     while true
         pn = s.next[p]
-        if s.id[p] != s.id[a] && s.id[pn] != s.id[a] && s.id[p] != s.id[b] && s.id[pn] != s.id[b] &&
+        if s.id[p] != s.id[a] &&
+                s.id[pn] != s.id[a] &&
+                s.id[p] != s.id[b] &&
+                s.id[pn] != s.id[b] &&
                 ec_intersects(s, p, pn, a, b)
             return true
         end
@@ -595,7 +641,8 @@ function ec_middle_inside(s::EarcutState, a::Int, b::Int)::Bool
     py = (s.y[a] + s.y[b]) / 2
     while true
         pn = s.next[p]
-        if ((s.y[p] > py) != (s.y[pn] > py)) && s.y[pn] != s.y[p] &&
+        if ((s.y[p] > py) != (s.y[pn] > py)) &&
+                s.y[pn] != s.y[p] &&
                 (px < (s.x[pn] - s.x[p]) * (py - s.y[p]) / (s.y[pn] - s.y[p]) + s.x[p])
             inside = !inside
         end
@@ -629,29 +676,109 @@ function ec_split_polygon!(s::EarcutState, a::Int, b::Int)::Int
     return b2
 end
 
+# The fast path for convex rings without holes (rectangles of a `barplot`, wedges of a `pie`, ...). In such a ring every
+# vertex is an ear and none of the others can lie inside the triangle of an ear, so the ear test of `ec_earcut_linked!`
+# is just the sign of the area. This does the same clipping as `ec_earcut_linked!` (same triangles in the same order)
+# on two small index vectors, without building the state. Returns `nothing` if the ring is not strictly convex (or
+# anything is off with the arithmetic), when the general code has to do it.
+function ec_triangulate_convex(ring)::Union{Nothing, Vector{GLTriangleFace}}
+    n = length(ring)
+    (3 <= n <= 80) || return nothing
+    X(i) = Float64(ring[i][1])
+    Y(i) = Float64(ring[i][2])
+
+    # winding order of the ring, as in `ec_linked_list!` (which links the ring clockwise)
+    sm = 0.0
+    j = n
+    for i in 1:n
+        sm += (X(j) - X(i)) * (Y(i) + Y(j))
+        j = i
+    end
+    fwd = sm > 0
+    # position `k` of the linked list is the vertex `idx(k)` of the ring
+    idx(k) = fwd ? k : n - k + 1
+    nxt(k) = k == n ? 1 : k + 1
+    prv(k) = k == 1 ? n : k - 1
+    px(k) = X(idx(k))
+    py(k) = Y(idx(k))
+    area(a, b, c) = (py(b) - py(a)) * (px(c) - px(b)) - (px(b) - px(a)) * (py(c) - py(b))
+
+    # strictly convex: all turns the same way, and the edge directions change sign at most twice in x and in y
+    # (otherwise the ring winds around more than once, like a pentagram, and has points inside its ears)
+    xchanges = ychanges = 0
+    firstdx = lastdx = firstdy = lastdy = 0
+    for k in 1:n
+        area(prv(k), k, nxt(k)) < 0 || return nothing
+        dx = Int(sign(px(nxt(k)) - px(k)))
+        dy = Int(sign(py(nxt(k)) - py(k)))
+        if dx != 0
+            firstdx == 0 && (firstdx = dx)
+            xchanges += lastdx != 0 && dx != lastdx
+            lastdx = dx
+        end
+        if dy != 0
+            firstdy == 0 && (firstdy = dy)
+            ychanges += lastdy != 0 && dy != lastdy
+            lastdy = dy
+        end
+    end
+    xchanges += firstdx != lastdx # the edge from the last to the first position closes the cycle
+    ychanges += firstdy != lastdy
+    (xchanges <= 2 && ychanges <= 2) || return nothing
+
+    # clip the ears, starting from the last position, as `ec_earcut_linked!` does
+    faces = Vector{GLTriangleFace}(undef, n - 2)
+    links = Vector{Int}(undef, 2 * n) # prev of k at 2k - 1, next at 2k
+    for k in 1:n
+        links[2k - 1] = prv(k)
+        links[2k] = nxt(k)
+    end
+    ear = n
+    for t in 1:(n - 2)
+        a = links[2ear - 1]
+        c = links[2ear]
+        area(a, ear, c) < 0 || return nothing
+        faces[t] = GLTriangleFace(idx(a), idx(ear), idx(c))
+        links[2a] = c # remove the ear
+        links[2c - 1] = a
+        ear = links[2c] # skipping the next vertex leads to less sliver triangles
+    end
+    return faces
+end
+
 """
     earcut_triangulate(rings)::Vector{GLTriangleFace}
 
 Triangulate the polygon with outer ring `rings[1]` and holes `rings[2:end]`, each a vector of 2D points,
 using a pure Julia port of mapbox's earcut. The faces index into the concatenation of all `rings`, and are the
-same faces in the same order as `GeometryBasics.earcut_triangulate(rings)`, which calls `libearcut`.
+same faces in the same order as `GeometryBasics.earcut_triangulate(rings)`, which calls `libearcut`, with one exception:
+holes are linked into the outer ring from left to right, and the order of holes with the same leftmost x is that of a
+stable sort. That is also the order of `libearcut`'s `std::sort` up to 16 holes, but not necessarily with more, where the
+triangles may then differ from libearcut's (they are still a valid triangulation of the polygon).
 """
 function earcut_triangulate(rings::AbstractVector{<:AbstractVector{<:VecTypes{2}}})::Vector{GLTriangleFace}
-    faces = GLTriangleFace[]
-    isempty(rings) && return faces
-    s = EarcutState()
+    isempty(rings) && return GLTriangleFace[]
 
-    # the z-order curve hash is used when the shape is not too simple
+    if length(rings) == 1
+        faces = ec_triangulate_convex(rings[1])
+        faces === nothing || return faces
+    end
+
     npoints = 0
     for ring in rings
         npoints += length(ring)
     end
-    s.hashing = npoints > 80
+    # the z-order curve hash is used when the shape is not too simple
+    hashing = npoints > 80
+    # a node for each point, two more for each hole (its bridge to the outer ring), and a triangle for each point
+    # (plus two for each hole) of the polygon
+    nholes = length(rings) - 1
+    s = EarcutState(npoints + 2 * nholes + 2, max(npoints + 2 * nholes - 2, 0), hashing)
 
     outer = ec_linked_list!(s, rings[1], true)
-    (outer == 0 || s.prev[outer] == s.next[outer]) && return faces
+    (outer == 0 || s.prev[outer] == s.next[outer]) && return s.faces
 
-    length(rings) > 1 && (outer = ec_eliminate_holes!(s, rings, outer))
+    nholes > 0 && (outer = ec_eliminate_holes!(s, rings, outer))
 
     if s.hashing
         # calculate the polygon bbox
@@ -675,10 +802,5 @@ function earcut_triangulate(rings::AbstractVector{<:AbstractVector{<:VecTypes{2}
     end
 
     ec_earcut_linked!(s, outer)
-
-    sizehint!(faces, length(s.indices) ÷ 3)
-    for t in 1:3:length(s.indices)
-        push!(faces, GLTriangleFace(s.indices[t] + 1, s.indices[t + 1] + 1, s.indices[t + 2] + 1))
-    end
-    return faces
+    return s.faces
 end
