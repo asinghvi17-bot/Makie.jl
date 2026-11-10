@@ -220,7 +220,8 @@ end
         g1.y[], g2.z[], g3.w[]
     end
     try
-        shapes = StaticDispatch.install!(g1)
+        # (g1's input is fed by a plain Observable)
+        shapes = @test_logs (:warn, r"the inputs x are fed") StaticDispatch.install!(g1)
         @test length(shapes.graphs) == 3
         @invokelatest setindex!(obs, 3.0)
         @test @invokelatest(g1.y[]) == 6.0
@@ -231,8 +232,9 @@ end
     end
 end
 
-@testset "install! finds the graph producing an Observable" begin
-    # g2 is fed by an Observable of a g1 node, install! starts from g2
+# g2 is fed by an Observable of a g1 node. Returns g2 and an updater holding g1, so
+# g1 stays alive only as a field of an immutable struct
+function build_producer_graphs()
     g1 = ComputeGraph()
     add_input!(g1, :x, 1.0)
     map!(x -> 2x, g1, :x, :y)
@@ -245,10 +247,24 @@ end
         g1.x = v
         g2.z[]
     end
+    return g2, ComputePipeline.GraphObservablesUpdater(g1)
+end
+
+@testset "install! finds the graph producing an Observable" begin
+    StaticDispatch.track_graphs!()
+    @test StaticDispatch.istracking()
+    g2, updater = build_producer_graphs()
+    for _ in 1:3
+        GC.gc(true)
+    end
+    g1 = updater.graph
     try
-        shapes = StaticDispatch.install!(g2)
+        shapes = @test_logs StaticDispatch.install!(g2) # no warning
         @test length(shapes.graphs) == 2
         @test any(g -> g === g1, shapes.graphs)
+        # install! stops tracking
+        @test !StaticDispatch.istracking()
+        @test isempty(ComputePipeline.TRACKED_GRAPHS)
         @invokelatest setproperty!(g1, :x, 3.0)
         @test @invokelatest(g1.y[]) == 6.0
         @test @invokelatest(g2.z[]) == 7.0
@@ -257,24 +273,42 @@ end
     end
 end
 
-@testset "graph registry" begin
-    registered(g) = @lock ComputePipeline.GRAPH_REGISTRY_LOCK count(r -> r.value === g, ComputePipeline.GRAPH_REGISTRY)
+@testset "install! without tracking" begin
+    @test !StaticDispatch.istracking()
+    # the producer can't be found from g2, install! warns
+    g2, updater = build_producer_graphs()
+    try
+        shapes = @test_logs (:warn, r"the inputs y are fed by Observables which no graph") StaticDispatch.install!(g2)
+        @test length(shapes.graphs) == 1
+    finally
+        StaticDispatch.uninstall!()
+    end
+    # explicit roots
+    g1 = updater.graph
+    try
+        shapes = @test_logs StaticDispatch.install!(g2, g1)
+        @test length(shapes.graphs) == 2
+        @invokelatest setproperty!(g1, :x, 3.0)
+        @test @invokelatest(g2.z[]) == 7.0
+    finally
+        StaticDispatch.uninstall!()
+    end
+end
+
+@testset "graph tracking" begin
+    # off: nothing is recorded
+    @test !StaticDispatch.istracking()
+    foreach(_ -> ComputeGraph(), 1:100)
+    @test isempty(ComputePipeline.TRACKED_GRAPHS)
+    StaticDispatch.track_graphs!()
     graph = ComputeGraph()
-    add_input!(graph, :a, 1)
-    @test registered(graph) == 1
-    # once per graph, not per (re)created Observable
-    for _ in 1:3
-        ComputePipeline.get_observable!(graph, :a)
-        empty!(graph.observables)
-    end
-    @test registered(graph) == 1
-    # dead graphs are removed
-    for i in 1:5000
-        ComputeGraph()
-        i % 500 == 0 && GC.gc()
-    end
-    @test length(ComputePipeline.GRAPH_REGISTRY) < 2000
-    @test registered(graph) == 1
+    @test length(ComputePipeline.TRACKED_GRAPHS) == 1
+    @test ComputePipeline.TRACKED_GRAPHS[1] === graph
+    StaticDispatch.untrack!()
+    @test !StaticDispatch.istracking()
+    @test isempty(ComputePipeline.TRACKED_GRAPHS)
+    ComputeGraph()
+    @test isempty(ComputePipeline.TRACKED_GRAPHS)
 end
 
 @testset "is_same pairs warning" begin
