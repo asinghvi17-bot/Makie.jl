@@ -406,6 +406,37 @@ end
     finally
         StaticDispatch.uninstall!()
     end
+    # ... unless `get_observable!` returns it again while tracking
+    g1 = producer()
+    obs = ComputePipeline.get_observable!(g1, :y)
+    try
+        StaticDispatch.track_graphs!() do
+            g2 = consumer(obs)
+            @test ComputePipeline.get_observable!(g1, :y) === obs
+            shapes = @test_logs StaticDispatch.install!(g2) # no warning
+            @test length(shapes.graphs) == 2
+            @test any(g -> g === g1, shapes.graphs)
+        end
+        @invokelatest setproperty!(g1, :x, 3.0)
+        @test @invokelatest(g1.y[]) == 6.0
+    finally
+        StaticDispatch.uninstall!()
+    end
+    # ... or it is passed as a root
+    g1 = producer()
+    obs = ComputePipeline.get_observable!(g1, :y)
+    g2 = consumer(obs)
+    try
+        shapes = StaticDispatch.install!(g2, g1)
+        @test length(shapes.graphs) == 2
+        @invokelatest setproperty!(g1, :x, 3.0)
+        @test @invokelatest(g1.y[]) == 6.0
+    finally
+        StaticDispatch.uninstall!()
+    end
+    # with tracking off, a cached `get_observable!` records nothing
+    @test ComputePipeline.get_observable!(g1, :y) === obs
+    @test isempty(ComputePipeline.TRACKED_OBSERVABLES)
     @test !StaticDispatch.istracking()
 end
 
