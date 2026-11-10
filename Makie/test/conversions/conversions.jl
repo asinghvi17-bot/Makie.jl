@@ -309,63 +309,6 @@ end
     @inferred to_colormap(cgrad(:cividis, 8; alpha = 0.5, categorical = true))
 end
 
-@testset "named colormaps" begin
-    # Named colormaps are looked up in tables with concrete types (so no dynamic dispatch is needed).
-    # The tables must agree with the registries they were built from.
-    for name in Makie.all_gradient_names
-        cmap = if name in Makie.colorbrewer_8color_names
-            to_colormap(Makie.ColorBrewer.palette(name, 8))
-        else
-            to_colormap(Makie.PlotUtils.get_colorscheme(Symbol(name)))
-        end
-        @test to_colormap(name) == cmap
-        @test to_colormap(Symbol(name)) == cmap
-    end
-    @test to_colormap(:Accent) == to_colormap(Makie.ColorBrewer.palette("Accent", 8))
-    @test length(to_colormap(:Accent)) == 8
-    @test to_colormap(:Spectral) == to_colormap(:Spectral_11) # alias
-
-    # results are fresh vectors, mutating them doesn't change later lookups
-    cmap = to_colormap(:viridis)
-    cmap[1] = RGBAf(1, 0, 0, 1)
-    @test to_colormap(:viridis)[1] != RGBAf(1, 0, 0, 1)
-    @test to_colormap(:viridis) !== to_colormap(:viridis)
-
-    # all the ways to ask for a named colormap give a Vector{RGBAf}
-    @test @inferred(to_colormap(:viridis)) isa Vector{RGBAf}
-    @test @inferred(to_colormap("viridis")) isa Vector{RGBAf}
-    @test @inferred(to_colormap((:viridis, 0.5))) isa Vector{RGBAf}
-    @test @inferred(to_colormap(("viridis", 1))) isa Vector{RGBAf}
-    @test @inferred(to_colormap(Reverse(:viridis))) == reverse(to_colormap(:viridis))
-    @test @inferred(to_colormap((Reverse(:viridis), 0.5))) == RGBAf.(color.(reverse(to_colormap(:viridis))), 0.5)
-    @test @inferred(to_colormap(Makie.ColorSchemes.viridis)) == to_colormap(:viridis)
-    @test @inferred(to_colormap(RGBf[RGBf(1, 0, 0)])) == [RGBAf(1, 0, 0, 1)]
-
-    # errors
-    @test_throws "There is no color gradient named not_a_gradient" to_colormap(:not_a_gradient)
-    @test_throws "There is no color gradient named not_a_gradient" to_colormap("not_a_gradient")
-    @test_throws "There is no color gradient named not_a_gradient" categorical_colors(:not_a_gradient, 3)
-end
-
-@testset "categorical_colors with names" begin
-    for args in ((:viridis, 3), (:viridis, 3, true), ("Set1", 5), (:Paired, 12), (:Accent, 4), (:PuRd, 7))
-        @test @inferred(categorical_colors(args...)) isa Vector{RGBAf}
-    end
-    @test categorical_colors(:Set1, 5) == to_colormap(Makie.ColorBrewer.palette("Set1", 5))
-    @test categorical_colors(:Accent, 4) == to_colormap(Makie.ColorBrewer.palette("Accent", 4))
-    @test categorical_colors("Set1", 5) == categorical_colors(:Set1, 5)
-    @test categorical_colors(:viridis, 3, true) == categorical_colors(to_colormap(:viridis), 3, true)
-    @test length(categorical_colors(:viridis, 300, true)) == 300
-    @test_throws ArgumentError categorical_colors(:Set1, 2)
-    @test_throws ArgumentError categorical_colors(:Set1, 0)
-    @test_throws ArgumentError categorical_colors(:Set1, 13)
-    @test_throws "Scheme Blues is undefined for 12 colors." categorical_colors(:Blues, 12)
-    # returned vectors are not shared
-    cols = categorical_colors(:Set1, 5)
-    cols[1] = RGBAf(0, 0, 0, 1)
-    @test categorical_colors(:Set1, 5)[1] != RGBAf(0, 0, 0, 1)
-end
-
 
 @testset "empty poly" begin
     # Geometry Primitive

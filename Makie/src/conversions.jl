@@ -1618,6 +1618,42 @@ function available_gradients()
 end
 
 
+# Named colormaps in ahead-of-time compiled programs
+#
+# A name is looked up in PlotUtils' registry (`PlotUtils.get_colorscheme`) every time, so schemes can be overridden at
+# runtime. That registry is a `Dict{Symbol, ColorScheme}` with an abstract value type (`ColorScheme` is parameterized on
+# its colors), and ColorBrewer's palettes are `JSON.Object{String, Any}`s of color strings, so the lookup is
+# dynamically dispatched and can't be compiled by `juliac --trim` or WasmCodegen with `trim = :safe`.
+#
+# The preference `static_colormaps` switches Makie, when it is precompiled, to concretely typed `Dict{String, Vector{RGBAf}}`
+# tables that hold only the colormaps it lists. It is unset by default: then none of this exists, `to_colormap` and
+# `categorical_colors` are exactly the registry lookups, and the tables are empty. See `set_static_colormaps!`.
+# The preference is read when Makie is precompiled (like `precompile_workload_level`) so that inference sees one lookup
+# only, and Julia recompiles Makie when it changes.
+#
+# The default colormap of Makie's theme (`:viridis`) is always in the tables, so a plot without a `colormap` works.
+const static_default_colormaps = ["viridis"]
+
+# `nothing` for registry lookups, otherwise the sorted names the tables hold.
+function static_colormap_names_from(pref)
+    (pref === nothing || pref === false) && return nothing
+    if pref === true || pref == "all"
+        return sort!(collect(all_gradient_names))
+    end
+    names = pref isa Union{AbstractString, Symbol} ? [string(pref)] : [string(n) for n in pref]
+    unknown = filter(!in(all_gradient_names), names)
+    isempty(unknown) || error(
+        """
+        Unknown colormap name(s) in the `static_colormaps` preference: $(join(unknown, ", ")).
+        See `Makie.available_gradients()` for the list of available gradients.
+        """
+    )
+    return sort!(unique!(vcat(static_default_colormaps, names)))
+end
+
+const static_colormap_names = static_colormap_names_from(Preferences.@load_preference("static_colormaps", nothing))
+const static_colormaps_enabled = static_colormap_names !== nothing
+
 to_colormap(cm, categories::Integer) = error("`to_colormap(cm, categories)` is deprecated. Use `Makie.categorical_colors(cm, categories)` for categorical colors, and `resample_cmap(cmap, ncolors)` for continuous resampling.")
 
 """
@@ -1641,17 +1677,28 @@ function categorical_colors(cols::AbstractVector, categories::Integer, cycle = f
     return categorical_colors(to_color.(cols), categories, cycle)
 end
 
-function categorical_colors(cs::Union{String, Symbol}, categories::Integer, cycle = false)::Vector{RGBAf}
-    cs_string = string(cs)
-    haskey(named_colormaps, cs_string) || no_gradient_error(cs)
-    palettes = get(colorbrewer_palettes, cs_string, nothing)
-    return if palettes === nothing
-        categorical_colors(to_colormap(cs_string), categories, cycle)
-    else
-        if !(1 <= categories <= length(palettes)) || isempty(palettes[categories])
-            throw(ArgumentError("Scheme $cs_string is undefined for $categories colors."))
+@static if static_colormaps_enabled
+    function categorical_colors(cs::Union{String, Symbol}, categories::Integer, cycle = false)::Vector{RGBAf}
+        return static_categorical_colors(static_colormaps, cs, categories, cycle)
+    end
+else
+    function categorical_colors(cs::Union{String, Symbol}, categories::Integer, cycle = false)
+        cs_string = string(cs)
+        return if cs_string in all_gradient_names
+            if haskey(ColorBrewer.colorSchemes, cs_string)
+                return to_colormap(ColorBrewer.palette(cs_string, categories))
+            else
+                return categorical_colors(to_colormap(cs_string), categories, cycle)
+            end
+        else
+            error(
+                """
+                There is no color gradient named $cs.
+                See `available_gradients()` for the list of available gradients,
+                or look at https://docs.makie.org/dev/explanations/colors#Colormaps.
+                """
+            )
         end
-        copy(palettes[categories])
     end
 end
 
@@ -1662,8 +1709,8 @@ struct Reverse{T}
     data::T
 end
 
-to_colormap(r::Reverse)::Vector{RGBAf} = reverse(to_colormap(r.data))
-to_colormap(cs::ColorScheme)::Vector{RGBAf} = to_colormap(cs.colors)
+to_colormap(r::Reverse) = reverse(to_colormap(r.data))
+to_colormap(cs::ColorScheme) = to_colormap(cs.colors)
 
 
 """
@@ -1679,16 +1726,43 @@ function to_colormap(cs::Tuple{<:Union{Reverse, Symbol, AbstractString}, Real}):
     return RGBAf.(color.(cmap), alpha.(cmap) .* cs[2]) # We need to rework this to conform to the backend interface.
 end
 
-# Named colormaps are resolved through tables that are built once, while Makie is precompiled.
-# ColorSchemes' and PlotUtils' registries are `Dict{Symbol, ColorScheme}` (an abstract value type, because
-# `ColorScheme` is parameterized on its color vector type) and ColorBrewer's palettes are `JSON.Object{String, Any}`
-# holding color strings, so looking a name up in them at runtime can't be inferred and needs dynamic dispatch.
-# The tables below have concrete types and the lookups in `to_colormap` and `categorical_colors` are statically dispatched.
-# Like `all_gradient_names`, they are a snapshot: schemes registered in ColorSchemes later are not picked up.
-function build_named_colormaps()
+"""
+    to_colormap(cs::Union{String, Symbol})::Vector{RGBAf}
+
+A Symbol/String naming the gradient. For more on what names are available please see: `available_gradients()`.
+For now, we support gradients from `PlotUtils` natively.
+"""
+@static if static_colormaps_enabled
+    function to_colormap(cs::Union{String, Symbol})::Vector{RGBAf}
+        return static_to_colormap(static_colormaps, cs)
+    end
+else
+    function to_colormap(cs::Union{String, Symbol})::Vector{RGBAf}
+        cs_string = string(cs)
+        return if cs_string in all_gradient_names
+            if cs_string in colorbrewer_8color_names # special handling for 8 color only
+                return to_colormap(ColorBrewer.palette(cs_string, 8))
+            else
+                # cs_string must be in plotutils_names
+                return to_colormap(PlotUtils.get_colorscheme(Symbol(cs_string)))
+            end
+        else
+            error(
+                """
+                There is no color gradient named $cs.
+                See `Makie.available_gradients()` for the list of available gradients,
+                or look at https://docs.makie.org/dev/explanations/colors#Colormaps.
+                """
+            )
+        end
+    end
+end
+
+# The colormaps of `names`, converted as the registry lookups of `to_colormap` do (so the colors are identical).
+function build_static_colormaps(names)
     table = Dict{String, Vector{RGBAf}}()
     converted = IdDict{Any, Vector{RGBAf}}() # aliases share their colorscheme, so share the converted colors
-    for name in all_gradient_names
+    for name in names
         source = if name in colorbrewer_8color_names # special handling for 8 color only
             ColorBrewer.palette(name, 8)
         else
@@ -1699,40 +1773,109 @@ function build_named_colormaps()
     return table
 end
 
-const named_colormaps = build_named_colormaps()
-
-# colorbrewer_palettes[name][n] holds the n-color palette of `name`, empty if ColorBrewer doesn't define it.
-function build_colorbrewer_palettes()
+# palettes[name][n] holds the n-color palette of the ColorBrewer scheme `name` that `categorical_colors` returns,
+# empty if ColorBrewer doesn't define it. Only the schemes among `names` are included.
+function build_static_colorbrewer_palettes(names)
     table = Dict{String, Vector{Vector{RGBAf}}}()
-    for (name, palettes) in ColorBrewer.colorSchemes
-        sizes = [parse(Int, n) for n in keys(palettes) if all(isdigit, n)]
+    for name in names
+        haskey(ColorBrewer.colorSchemes, name) || continue
+        sizes = [parse(Int, n) for n in keys(ColorBrewer.colorSchemes[name]) if all(isdigit, n)]
         table[name] = [n in sizes ? to_colormap(ColorBrewer.palette(name, n)) : RGBAf[] for n in 1:maximum(sizes)]
     end
     return table
 end
 
-const colorbrewer_palettes = build_colorbrewer_palettes()
+struct StaticColormaps
+    colormaps::Dict{String, Vector{RGBAf}}
+    colorbrewer_palettes::Dict{String, Vector{Vector{RGBAf}}}
+end
 
-function no_gradient_error(cs)
+StaticColormaps(names) = StaticColormaps(build_static_colormaps(names), build_static_colorbrewer_palettes(names))
+
+# These are the tables `to_colormap` and `categorical_colors` use when `static_colormaps_enabled`. They are empty otherwise.
+const static_colormaps = StaticColormaps(something(static_colormap_names, String[]))
+
+# The error for a name that isn't in the tables, which says how to add it.
+@noinline function throw_missing_static_colormap(table::StaticColormaps, cs)
     return error(
         """
-        There is no color gradient named $cs.
-        See `Makie.available_gradients()` for the list of available gradients,
-        or look at https://docs.makie.org/dev/explanations/colors#Colormaps.
+        The colormap `$cs` is not in Makie's static colormap tables, which hold $(length(table.colormaps)) colormaps.
+        Programs compiled ahead of time (`juliac --trim`, WasmCodegen) can't look colormaps up in the ColorSchemes registry,
+        so Makie only includes the colormaps listed in its `static_colormaps` preference. To add this one, run
+            using Makie; Makie.set_static_colormaps!("$cs")
+        in the project you compile in and restart Julia so that Makie is recompiled (`Makie.set_static_colormaps!(all = true)`
+        includes every colormap). If `$cs` is not a colormap, see `Makie.available_gradients()`.
         """
     )
 end
 
-"""
-    to_colormap(cs::Union{String, Symbol})::Vector{RGBAf}
-
-A Symbol/String naming the gradient. For more on what names are available please see: `available_gradients()`.
-For now, we support gradients from `PlotUtils` natively.
-"""
-function to_colormap(cs::Union{String, Symbol})::Vector{RGBAf}
-    colors = get(named_colormaps, string(cs), nothing)
-    colors === nothing && no_gradient_error(cs)
+function static_to_colormap(table::StaticColormaps, cs::Union{String, Symbol})::Vector{RGBAf}
+    colors = get(table.colormaps, string(cs), nothing)
+    colors === nothing && throw_missing_static_colormap(table, cs)
     return copy(colors) # callers may mutate the result
+end
+
+function static_categorical_colors(table::StaticColormaps, cs::Union{String, Symbol}, categories::Integer, cycle)::Vector{RGBAf}
+    cs_string = string(cs)
+    haskey(table.colormaps, cs_string) || throw_missing_static_colormap(table, cs)
+    palettes = get(table.colorbrewer_palettes, cs_string, nothing)
+    return if palettes === nothing
+        categorical_colors(static_to_colormap(table, cs_string), categories, cycle)
+    else
+        if !(1 <= categories <= length(palettes)) || isempty(palettes[categories])
+            throw(ArgumentError("Scheme $cs_string is undefined for $categories colors."))
+        end
+        copy(palettes[categories])
+    end
+end
+
+function check_colormap_names(names)
+    unknown = filter(!in(all_gradient_names), names)
+    return isempty(unknown) || error("Unknown colormap name(s): $(join(unknown, ", ")). See `Makie.available_gradients()` for the list of available gradients.")
+end
+
+"""
+    set_static_colormaps!(names...; all = false)
+    set_static_colormaps!(names::AbstractVector; all = false)
+
+Choose the named colormaps (`:magma`, `"Set1"`, ...) that Makie includes when it is compiled ahead of time with `juliac --trim`
+or to WebAssembly with WasmCodegen. Call it once in the project that you compile in, before compiling, then restart Julia so
+that Makie recompiles. With `all = true`, every colormap is included (well over a megabyte in a WebAssembly module).
+
+By default, a named colormap is looked up in the ColorSchemes registry every time it is converted. That lookup can't be
+compiled ahead of time (it is dynamically dispatched), so with this preference set, `to_colormap(::Symbol)`, `Reverse(:name)`,
+`(:name, alpha)` and `categorical_colors(:name, n)` look names up in tables with concrete types that hold only the colormaps
+listed here (and the default colormap `:viridis`). A name missing from the tables throws an error that says so. Native
+programs that don't set the preference are not affected: they keep looking names up in the registry, and can still override
+colorschemes.
+
+The choice is stored as the `static_colormaps` preference of Makie, in `LocalPreferences.toml` of the active project,
+and can also be written there directly:
+
+```toml
+[Makie]
+static_colormaps = ["magma", "Set1"]   # or "all"
+```
+
+`unset_static_colormaps!()` removes it again.
+"""
+function set_static_colormaps!(names...; all::Bool = false)
+    names = String[string(n) for n in Iterators.flatten(n isa Union{AbstractString, Symbol} ? (n,) : n for n in names)]
+    check_colormap_names(names)
+    Preferences.set_preferences!(@__MODULE__, "static_colormaps" => all ? "all" : names; force = true)
+    @info "Makie's static colormaps are set. Restart Julia so that Makie recompiles with them." names = all ? "all" : static_colormap_names_from(names)
+    return nothing
+end
+
+"""
+    unset_static_colormaps!()
+
+Remove the `static_colormaps` preference (see [`set_static_colormaps!`](@ref)): Makie looks named colormaps up in the registry again, after a restart.
+"""
+function unset_static_colormaps!()
+    Preferences.delete_preferences!(@__MODULE__, "static_colormaps"; force = true)
+    @info "Makie's static colormaps are removed. Restart Julia so that Makie recompiles without them."
+    return nothing
 end
 
 # Handle inbuilt PlotUtils types
