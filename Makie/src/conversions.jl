@@ -651,11 +651,16 @@ function convert_arguments(
     return (merge_meshes(converted),)
 end
 
-empty_vector(::Type{V}) where {V <: AbstractVector} = V()
+# The vectors that `merge_meshes` collects the attributes and faces of its meshes into, whatever
+# they are backed by (views and ranges for example, which cannot be constructed empty).
+collected_vector_type(::Type{V}) where {V <: AbstractVector} = Vector{eltype(V)}
+empty_vector(::Type{V}) where {V <: AbstractVector} = collected_vector_type(V)()
 function empty_mesh(::Type{<:GeometryBasics.Mesh{D, T, FT, Names, VAT, FVT}}) where {D, T, FT, Names, VAT, FVT}
     attributes = NamedTuple{Names}(map(empty_vector, fieldtypes(VAT)))
     return GeometryBasics.Mesh(attributes, empty_vector(FVT), UnitRange{UInt32}[])
 end
+is_collected(::Type{<:GeometryBasics.Mesh{D, T, FT, Names, VAT, FVT}}) where {D, T, FT, Names, VAT, FVT} =
+    FVT <: Vector && all(A -> A <: Vector, fieldtypes(VAT))
 
 # `merge` of GeometryBasics picks the dimension and element type of the merged positions from the data
 # (`Point{maximum(ndims, meshes), T}`), so the type of the mesh it returns is not inferred (and it cannot be
@@ -669,13 +674,14 @@ merge_meshes(meshes, ::Val{true}) = merge(meshes)
 function merge_meshes(meshes::Vector{M}, ::Val{false}) where {M <: GeometryBasics.Mesh}
     isempty(meshes) && return empty_mesh(M)
     m1 = meshes[1]
-    length(meshes) == 1 && return m1
+    # (a single mesh is kept as it is only if it is already of the type that the merge of more of them has)
+    length(meshes) == 1 && is_collected(M) && return m1
 
     attributes = map(collect, GeometryBasics.vertex_attributes(m1))
     fs = collect(faces(m1))
     idx = length(fs)
     offset = length(coordinates(m1))
-    views = isempty(m1.views) ? UnitRange{UInt32}[1:idx] : copy(m1.views)
+    views = isempty(m1.views) && length(meshes) > 1 ? UnitRange{UInt32}[1:idx] : copy(m1.views)
 
     for i in 2:length(meshes)
         mesh = meshes[i]
