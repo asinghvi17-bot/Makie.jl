@@ -262,12 +262,19 @@ function convert_dim_value(conv, attr, value, last_value, element_index)
 end
 
 function convert_dim_value(conv, attr, points::AbstractArray{<:VecTypes}, last_value, element_index)
-    # (of the type of the components, as for other `points`, so that the result type does not depend on `isempty`)
-    isempty(points) && return eltype(eltype(points))[]
+    isempty(points) && return empty_dim_value(eltype(eltype(points)))
     dim_value = [p[element_index] for p in points]
     last_dim_value = last_value === nothing ? nothing : [p[element_index] for p in last_value]
     return convert_dim_value(conv, attr, dim_value, last_dim_value)
 end
+
+# The converted components of no points, of the type of the components if it is a number, as for other points
+# without a conversion, so that the result type does not depend on `isempty`. The component type of a
+# heterogeneous `Tuple` (`Tuple{Date, Float64}`) is a join (`Any`) and that of dates etc. is converted to
+# numbers: they are `Float64`, as before.
+empty_dim_value(::Type{T}) where {T} = empty_dim_value(T, Val(T <: Real && isconcretetype(T)))
+empty_dim_value(::Type{T}, ::Val{true}) where {T} = T[]
+empty_dim_value(::Type, ::Val{false}) = Float64[]
 
 function convert_dim_value(conv, attr, point::VecTypes, last_value, element_index)
     last = last_value === nothing ? nothing : last_value[element_index]
