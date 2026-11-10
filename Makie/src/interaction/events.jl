@@ -317,7 +317,10 @@ function _ispressed(parent, x, waspressed, nested::Bool)::Bool
     x isa Tuple && return _all_ispressed(parent, x, waspressed)
     x isa Union{Vector, Set} && return _ispressed_collection(parent, x, waspressed)
     nested && return ispressed(parent, x, waspressed)::Bool
-    throw(ArgumentError("`ispressed` is not defined for $(typeof(x)), see `IsPressedInputType` for the supported types."))
+    # `x` can be abstractly typed here, and interpolating an abstract `typeof(x)` makes the exception message a
+    # tuple of abstract type, which WasmCodegen's strict build rejects. The barrier gives a concrete type.
+    T = Base.inferencebarrier(typeof(x))::DataType
+    throw(ArgumentError("`ispressed` is not defined for $T, see `IsPressedInputType` for the supported types."))
 end
 
 # A `Vector` or `Set` of unknown element type (a button read as `IsPressedInputType` or `Any`, or an element of a
