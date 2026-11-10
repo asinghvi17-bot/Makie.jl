@@ -298,7 +298,8 @@ end
 # `isa`, instead of one method per type. The button usually reaches a call site as a `Union` of all of them
 # (e.g. `Observable{IsPressedInputType}`) or as `Any` (attributes), so inference sees every `ispressed` method as a
 # candidate. That is a dynamic dispatch, which static compilation (juliac `--trim=safe`) cannot resolve. A single
-# method resolves for any argument type.
+# method resolves for any argument type. That only removes the dispatch on `ispressed`. Whether the body is statically
+# compilable depends on the types that reach it, see the comment on `_COLLECTION_ELTYPES`.
 #
 # `nested` is false for the call from `ispressed` itself and true for the elements of operators and collections.
 # Those go through `ispressed` again if they are not one of the supported types, so that methods added to `ispressed`
@@ -319,12 +320,17 @@ function _ispressed(parent, x, waspressed, nested::Bool)::Bool
     throw(ArgumentError("`ispressed` is not defined for $(typeof(x)), see `IsPressedInputType` for the supported types."))
 end
 
-# Iterating a Vector or Set is statically compiled (juliac `--trim`, Wasm) only with a concrete element type. These
-# are the ones that occur for a collection of buttons: `Set((Keyboard.a, Mouse.left))` is a `Set{Enum{Int32}}`,
-# `[a & b, c | d]` a `Vector{BooleanOperator}`, and `Any` is what an untyped literal gives. Every other element type
-# (`[a & b]` is a `Vector{And{Keyboard.Button, Mouse.Button}}`, `Union`s, empty collections, ...) is iterated the same
-# way, element by element, but when the type of the collection is not known where `ispressed` is called (e.g. it comes
-# from an `Any`), the call to `_all_ispressed` for it is a dynamic dispatch.
+# Iterating a Vector or Set is statically compiled (juliac `--trim`, Wasm) when its type is concrete where it is
+# iterated, and `_ispressed_collection` selects the concrete type with `isa` for these element types: buttons (`Set((a,
+# Mouse.left))` is a `Set{Enum{Int32}}`), `Union{Keyboard.Button, Mouse.Button}`, `BooleanOperator`, `Bool` and `Any`.
+# Every other element type (`[a & b]` is a `Vector{And{Keyboard.Button, Mouse.Button}}`, `Union`s, empty collections,
+# ...) is iterated the same way, but through the last line of `_ispressed_collection`.
+# Checked with a strict WasmCodegen compile (verify = :error, trim = :safe): a collection whose type is concrete at the
+# call of `ispressed` (`Vector{Keyboard.Button}`, `Vector{And{...}}`, `Set{Union{Keyboard.Button, Mouse.Button}}`,
+# `Tuple`) compiles. A button that is read as `IsPressedInputType` or `Any` (an `Observable{IsPressedInputType}`, an
+# attribute) does not, and neither does a `Vector{Any}` or a `Vector{BooleanOperator}` whose elements can again be a
+# collection: the `Set` of an unknown element type then reaches the last line of `_ispressed_collection`, and
+# iterating it is an unresolved call (`Base.KeySet`, `iterate`). `Vector` is not affected, only `Set`.
 const _COLLECTION_ELTYPES = (
     Keyboard.Button, Mouse.Button, Enum{Int32}, Union{Keyboard.Button, Mouse.Button}, BooleanOperator, Bool, Any,
 )
