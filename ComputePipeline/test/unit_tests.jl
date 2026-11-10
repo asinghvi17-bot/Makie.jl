@@ -1788,3 +1788,56 @@ end
     e = resolve_error(() -> graph.later_too_long[])
     @test e isa ComputePipeline.ResultLengthMismatchError
 end
+
+@testset "Typed resolve with a callback returning Any" begin
+    # `holder[1]` is inferred as `Any`, so `locked_resolve!` must narrow the result
+    # itself instead of dispatching on it at runtime
+    holder = Any[(1.0,)]
+    graph = ComputeGraph()
+    add_input!(graph, :x, 1.0)
+    register_computation!(graph, [:x], [:y]) do inputs, changed, cached
+        return holder[1]
+    end
+    @test graph.y[] == 1.0 # dynamic first resolve
+    holder[1] = (2.0,)
+    graph.x = 2.0
+    @test graph.y[] == 2.0 # builds the TypedEdge
+    edge = graph.y.parent
+    @test isassigned(edge.typed_edge)
+    te = edge.typed_edge[]
+
+    args = Tuple{Any, Any, Any}
+    @test only(Base.return_types(te.callback, args)) === Any
+    # `set_result!` calls whose result argument is inferred as `Any` are dispatched
+    # at runtime on every update. (The `Tuple` variant stays a call with an
+    # abstract `Tuple`: the tuple length and element types are not known.)
+    function untyped_set_result_calls(f, sig)
+        ci = only(Base.code_typed(f, sig; optimize = true))[1]
+        argtype(a) = a isa Core.SSAValue ? ci.ssavaluetypes[a.id] :
+            a isa Core.Argument ? ci.slottypes[a.n] : Core.Typeof(a)
+        return count(ci.code) do stmt
+            stmt isa Expr && stmt.head === :call && stmt.args[1] isa GlobalRef &&
+                stmt.args[1].name === :set_result! && argtype(stmt.args[3]) === Any
+        end
+    end
+    @test untyped_set_result_calls(ComputePipeline.locked_resolve!, Tuple{typeof(te)}) == 0
+    @test untyped_set_result_calls(ComputePipeline.set_result_narrowed!, Tuple{typeof(te), Any}) == 0
+
+    # every kind of result still takes the same path as before
+    holder[1] = (3.0,)
+    graph.x = 3.0
+    @test graph.y[] == 3.0
+    holder[1] = ComputePipeline.skip_update
+    graph.x = 4.0
+    @test graph.y[] == 3.0
+    @test !graph.y.dirty
+    holder[1] = (5.0,)
+    graph.x = 5.0
+    @test graph.y[] == 5.0
+    holder[1] = (1, 2)
+    graph.x = 6.0
+    @test_throws ResolveException graph.y[]
+    holder[1] = 1
+    graph.x = 7.0
+    @test_throws ResolveException graph.y[]
+end

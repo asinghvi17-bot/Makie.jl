@@ -1282,7 +1282,23 @@ function locked_resolve!(edge::TypedEdge)
         vals = map(getindex, edge.outputs)
         last = NamedTuple{output_names(edge)}(vals)
         result = edge.callback(map(getindex, edge.inputs), dirty, last)
+        set_result_narrowed!(edge, result)
+    end
+    return
+end
+
+# `set_result!` for a callback result of any inferred type. A callback may be
+# inferred to return `Any` (e.g. it indexes a `Vector{Any}`), which would make the
+# `set_result!` call dynamic, so `result` is narrowed to each variant explicitly.
+function set_result_narrowed!(edge::TypedEdge, result)
+    if result isa Tuple
         set_result!(edge, result)
+    elseif result isa Nothing
+        set_result!(edge, nothing)
+    elseif result isa SkipUpdate
+        set_result!(edge, skip_update)
+    else
+        throw_invalid_result(result)
     end
     return
 end
