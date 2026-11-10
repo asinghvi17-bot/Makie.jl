@@ -1,0 +1,4 @@
+4c4
+<   plot 1: converted_strokecolor={length=I15,value=F[4;0.0]} vertex_color={length=I15,value=F[4;2.2]} wgl_positions={length=I15,value=F[2;2.0]}
+---
+>   plot 1: converted_strokecolor={length=I15,value=F[4;0.0]} glyph_data={glyph_hashes=U32[15;29729717924],scales=F[30;420.0]} vertex_color={length=I15,value=F[4;2.2]} wgl_positions={length=I15,value=F[2;2.0]}

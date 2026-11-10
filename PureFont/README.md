@@ -64,5 +64,10 @@ overrides in `wasm/font_overrides.jl`: 50 glyphs of a runtime text in Regular an
   0.0004 ms (hash lookup); the metrics of 96 uncached glyphs take 0.9-3.5 ms.
 - Compile peak RSS: 1.53-1.62 GiB, 196-245 s.
 
-Not done: the scene-level probes (`text!` in a `Scene` with WGLMakie) need WasmCompat's `Observables` extension
-(`feat/observables-ext` @8df2164), which could not be used in this run.
+### Scene level (WasmCompat `feat/observables-ext` @8df2164)
+
+`wasm/p_text_runtime.jl` is capmap's `p_text_atlas.jl` without the prerendered atlas and character set: a `text!` plot built natively, its text changed at
+run time ("Wasm 1.25 {ok}!", "Ω", "Wörld ÀÉÎ αβγ ñ ß ©"). Strict compile clean (11.4 MB, 513 s, 1.81 GiB peak RSS); in node:wasi it returns 0 and its digest equals
+native FreeType, except for the `glyph_data` resend that capmap's own `text_atlas.diff` shows too. "Ω" and the Latin-1/Greek text, which the build-time atlas rejects, work.
+The module is not smaller than the 10.1 MB prebuilt-atlas one: an 8 MiB native atlas is still reachable from somewhere (see `deliverable/NOTES.md`). Run it with
+`CAPMAP_PROBES=<capmap/probes> julia --project=ENV $CAPMAP_PROBES/build.jl wasm/p_text_runtime.jl out.wasm`.

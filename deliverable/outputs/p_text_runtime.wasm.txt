@@ -1,0 +1,10 @@
+ascii: 1 updates
+  plot 1: converted_rotation={length=I15,value=F[4;1.0]} converted_strokecolor={length=I15,value=F[4;0.0]} glyph_data={glyph_hashes=U32[15;29729717924],scales=F[30;420.0]} marker_offset=F[45;865.77] vertex_color={length=I15,value=F[4;2.0]} wgl_positions={length=I15,value=F[2;0.0]}
+position and color: 1 updates
+  plot 1: converted_strokecolor={length=I15,value=F[4;0.0]} glyph_data={glyph_hashes=U32[15;29729717924],scales=F[30;420.0]} vertex_color={length=I15,value=F[4;2.2]} wgl_positions={length=I15,value=F[2;2.0]}
+greek: 1 updates
+  plot 1: converted_rotation=F[4;1.0] converted_strokecolor=F[4;0.0] glyph_data={glyph_hashes=U32[1;4289653718],scales=F[2;28.0]} marker_offset=F[3;3.05] vertex_color=F[4;2.2] wgl_positions=F[2;2.0]
+latin-1 and greek: 1 updates
+  plot 1: converted_rotation={length=I19,value=F[4;1.0]} converted_strokecolor={length=I19,value=F[4;0.0]} glyph_data={glyph_hashes=U32[19;37941438596],scales=F[38;532.0]} marker_offset=F[57;1274.87] vertex_color={length=I19,value=F[4;2.2]} wgl_positions={length=I19,value=F[2;2.0]}
+
+[main returned 0]
