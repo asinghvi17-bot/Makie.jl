@@ -237,6 +237,25 @@ Makie.set_static_colormaps!(:magma, :RdBu, "Set1") # the colormaps that the prog
 ```
 
 Names are added to the ones already chosen (`Makie.set_static_colormaps!(...; replace = true)` replaces them), so you can call it again when the program needs another colormap.
+
+Instead of listing the names by hand, you can let Makie find them: `Makie.record_colormaps(f)` calls `f()` and returns the names of the colormaps that were looked up while it ran.
+Run the code that builds the program's figures natively in your build script, with the inputs that choose its colormaps:
+
+```julia
+using Makie
+include("app.jl") # defines build_figure(choice)
+names = Makie.record_colormaps() do
+    for choice in (:magma, :RdBu) # every colormap that the program lets its users pick
+        build_figure(choice)
+    end
+end
+Makie.set_static_colormaps!(names)
+```
+
+This also finds the colormaps that come from themes and defaults, from recipes and blocks such as `Colorbar`, and the names that are computed at run time, which a search of the code for `colormap = :name` would miss.
+Plots compute their colors lazily, when they are displayed; `record_colormaps` computes the colormaps of the plots that were made while `f` ran, so `f` doesn't need to display them.
+If the preference is set already, a colormap that is missing from the tables is recorded too (and replaced by `:viridis` while `f` runs), so running the same build script again adds the colormaps that the program started to use since.
+A name that is never looked up while `f` runs is not recorded, so make sure that `f` makes every plot that the compiled program can make.
 This writes to the `LocalPreferences.toml` of the active project, which you can also edit directly:
 
 ```toml

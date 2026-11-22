@@ -1654,6 +1654,21 @@ end
 const static_colormap_names = static_colormap_names_from(Preferences.@load_preference("static_colormaps", nothing))
 const static_colormaps_enabled = static_colormap_names !== nothing
 
+# What `record_colormaps` records while it runs (`nothing` otherwise): the names of the colormaps looked up, and the
+# compute graphs of the plots with a colormap, whose colormaps it computes in the end (they are computed lazily).
+struct ColormapRecording
+    names::Set{String}
+    graphs::Vector{ComputeGraph}
+end
+
+const colormap_recording = Ref{Union{Nothing, ColormapRecording}}(nothing)
+
+function record_colormap_name(cs_string::String)
+    recording = colormap_recording[]
+    recording === nothing || push!(recording.names, cs_string)
+    return nothing
+end
+
 to_colormap(cm, categories::Integer) = error("`to_colormap(cm, categories)` is deprecated. Use `Makie.categorical_colors(cm, categories)` for categorical colors, and `resample_cmap(cmap, ncolors)` for continuous resampling.")
 
 """
@@ -1685,6 +1700,7 @@ else
     function categorical_colors(cs::Union{String, Symbol}, categories::Integer, cycle = false)
         cs_string = string(cs)
         return if cs_string in all_gradient_names
+            record_colormap_name(cs_string)
             if haskey(ColorBrewer.colorSchemes, cs_string)
                 return to_colormap(ColorBrewer.palette(cs_string, categories))
             else
@@ -1740,6 +1756,7 @@ else
     function to_colormap(cs::Union{String, Symbol})::Vector{RGBAf}
         cs_string = string(cs)
         return if cs_string in all_gradient_names
+            record_colormap_name(cs_string)
             if cs_string in colorbrewer_8color_names # special handling for 8 color only
                 return to_colormap(ColorBrewer.palette(cs_string, 8))
             else
@@ -1810,15 +1827,32 @@ const static_colormaps = StaticColormaps(something(static_colormap_names, String
     )
 end
 
+# While `record_colormaps` runs, a colormap that isn't in the tables is recorded and replaced by the tables' default
+# colormap (the colors don't matter there), so that one run finds all of the missing ones.
+function missing_static_colormap(table::StaticColormaps, cs)::Vector{RGBAf}
+    cs_string = string(cs)
+    if colormap_recording[] !== nothing && cs_string in all_gradient_names
+        record_colormap_name(cs_string)
+        for name in static_default_colormaps
+            colors = get(table.colormaps, name, nothing)
+            colors === nothing || return copy(colors)
+        end
+    end
+    return throw_missing_static_colormap(table, cs)
+end
+
 function static_to_colormap(table::StaticColormaps, cs::Union{String, Symbol})::Vector{RGBAf}
-    colors = get(table.colormaps, string(cs), nothing)
-    colors === nothing && throw_missing_static_colormap(table, cs)
+    cs_string = string(cs)
+    colors = get(table.colormaps, cs_string, nothing)
+    colors === nothing && return missing_static_colormap(table, cs)
+    record_colormap_name(cs_string)
     return copy(colors) # callers may mutate the result
 end
 
 function static_categorical_colors(table::StaticColormaps, cs::Union{String, Symbol}, categories::Integer, cycle)::Vector{RGBAf}
     cs_string = string(cs)
-    haskey(table.colormaps, cs_string) || throw_missing_static_colormap(table, cs)
+    haskey(table.colormaps, cs_string) || return categorical_colors(missing_static_colormap(table, cs), categories, true)
+    record_colormap_name(cs_string)
     palettes = get(table.colorbrewer_palettes, cs_string, nothing)
     return if palettes === nothing
         categorical_colors(static_to_colormap(table, cs_string), categories, cycle)
@@ -1864,7 +1898,8 @@ Julia only applies a preference of Makie in a project that maps Makie's UUID, i.
 This function adds the `[extras]` entry for Makie to the project's `Project.toml` for you. The preference is read when Makie is
 precompiled; if Makie is part of a system image, the choice is baked into it, so changing it needs a new system image.
 
-`unset_static_colormaps!()` removes it again.
+`record_colormaps(f)` finds the names that a program uses: `set_static_colormaps!(record_colormaps(build_figures))`.
+`unset_static_colormaps!()` removes the preference again.
 """
 function set_static_colormaps!(names...; all::Bool = false, replace::Bool = false)
     names = String[string(n) for n in Iterators.flatten(n isa Union{AbstractString, Symbol} ? (n,) : n for n in names)]
@@ -1892,6 +1927,48 @@ function unset_static_colormaps!()
     Preferences.delete_preferences!(@__MODULE__, "static_colormaps"; block_inheritance = true, force = true)
     @info "Makie's static colormaps are removed. Restart Julia so that Makie recompiles without them."
     return nothing
+end
+
+"""
+    record_colormaps(f) -> Vector{String}
+
+Call `f()` and return the sorted names of the named colormaps (`:magma`, `"Set1"`, ...) that were looked up while it ran,
+to choose the colormaps of a program compiled ahead of time:
+
+```julia
+using Makie
+include("app.jl")  # defines `build_figure()`, which builds the program's figures
+Makie.set_static_colormaps!(Makie.record_colormaps(build_figure))
+```
+
+then restart Julia and compile. Run the code that builds the program's figures natively, with the inputs that select its
+colormaps, e.g. once for each colormap a menu offers. The names include the ones from themes and defaults (`:viridis`,
+the `Colorbar`'s, ...) and the ones computed at run time, which a search of the code for `colormap = :name` would miss.
+
+Plots compute their colors lazily, when they are displayed. The colormaps of the plots made while `f` runs are computed
+before this returns, so `f` doesn't have to display them.
+
+If the `static_colormaps` preference is set already, a colormap that is missing from the tables is recorded too, and
+replaced by `:viridis` while `f` runs, instead of throwing an error. `set_static_colormaps!` adds the names to the ones
+chosen before; pass `replace = true` to drop the colormaps that the program doesn't use anymore.
+"""
+function record_colormaps(f)
+    outer = colormap_recording[]
+    recording = ColormapRecording(Set{String}(), ComputeGraph[])
+    colormap_recording[] = recording
+    try
+        f()
+        # (a plot made while computing these is added to the end)
+        i = 1
+        while i <= length(recording.graphs)
+            recording.graphs[i][:raw_colormap][]
+            i += 1
+        end
+    finally
+        colormap_recording[] = outer
+    end
+    outer === nothing || union!(outer.names, recording.names) # in an outer `record_colormaps`
+    return sort!(collect(recording.names))
 end
 
 # Handle inbuilt PlotUtils types

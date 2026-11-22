@@ -60,4 +60,17 @@ include(joinpath(@__DIR__, "named_colormaps_reference.jl")) # registry_colormap,
     @test pl.raw_colormap[] == registry_colormap("magma")
     f, ax, pl = heatmap(rand(4, 4); colormap = Reverse(:Spectral))
     @test pl.raw_colormap[] == reverse(registry_colormap("Spectral"))
+
+    # record_colormaps finds the colormaps that are missing from the tables, too: they are replaced by :viridis while it
+    # runs, instead of throwing
+    names = Makie.record_colormaps() do
+        heatmap(rand(4, 4); colormap = :inferno)
+        f, ax, pl = heatmap(rand(4, 4); colormap = :magma)
+        @test to_colormap(:Set2) == registry_colormap("viridis")
+        @test categorical_colors(:Set1, 3) == brewer_palette("Set1", 3)
+        nothing
+    end
+    @test names ⊇ ["Set1", "Set2", "inferno", "magma"]
+    @test names ⊆ ["Set1", "Set2", "inferno", "magma", "viridis"]
+    @test_throws "The colormap `inferno` is not" to_colormap(:inferno)
 end

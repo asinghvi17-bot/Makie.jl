@@ -191,6 +191,8 @@ add_alpha(color, alpha) = add_alpha(Colors.color(color), Colors.alpha(color), al
 add_alpha(rgb, a::T, alpha) where {T} = RGBA(rgb, a * T(alpha))
 
 function register_colormapping_without_color!(attr::ComputeGraph)
+    recording = colormap_recording[]
+    recording === nothing || push!(recording.graphs, attr) # see `record_colormaps`
     map!(attr, [:colormap, :alpha], [:alpha_colormap, :raw_colormap, :color_mapping, :color_mapping_type]) do icm, a
         # Raw colormap from ColorGradient, which isn't scaled. We need to preserve this for later steps
         # This only differs from alpha_colormap in that it doesn't resample PlotUtils.ColorGradient...
