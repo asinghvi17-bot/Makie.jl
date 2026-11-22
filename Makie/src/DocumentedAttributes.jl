@@ -36,7 +36,7 @@ default_key_expr(x::Symbol) = :(($(QuoteNode(x)),))
 default_key_expr(x::QuoteNode) = :(($x,))
 function default_key_expr(expr::Expr)
     if !(expr.head == :tuple && all(x -> x isa QuoteNode, expr.args))
-        error("$expr is not a valid inheritance key")
+        error("$expr is not a valid. Should be a Symbol (`:var`), name (`var`) or tuple thereof (`(outer, inner)`).")
     end
     for i in eachindex(expr.args)
         expr.args[i] = ifelse(expr.args[i] isa Symbol, QuoteNode(expr.args[i]), expr.args[i])
@@ -164,8 +164,11 @@ To more easily lookup the type for an attribute index there also is:
 - `attr.nested_docstring` contains a docstring or nothing for each positive
     index in `attr.nesting`, i.e. for each nesting layer. The base layer (1) is
     never documented
-- `attr.merged_key_to_index` a `Dict` mapping merged keys to attribute indices
-- `attr.inherit` a `Vector` of attribute indices that inherit
+- `attr.merged_key_to_index` is a `Dict` mapping merged keys to attribute indices
+- `attr.inherit` is a `Vector` of attribute indices that inherit
+- `attr.deprecation_indices` is a `Vector` of index Pairs, but indexing the
+    per-attribute fields. The first identifies a deprecated attribute, the latter
+    it's replacement.
 """
 struct DocumentedAttributes
     # This contains a collection of Dicts that trace nesting paths:
@@ -197,6 +200,9 @@ struct DocumentedAttributes
 
     # leaf node indices of every inherited attribute
     inherit::Vector{Int}
+
+    # index into merged_keys marking deprecated attributes
+    deprecation_indices::Vector{Pair{Int, Int}}
 end
 
 function DocumentedAttributes()
@@ -206,7 +212,8 @@ function DocumentedAttributes()
         String[], Union{Nothing, String}[], # per leaf expr, docstrings
         Union{Nothing, String}[nothing], # nested docstrings
         Int[], Type[], Vector{Int}[], # types
-        Int[] # inherit
+        Int[], # inherit
+        Pair{Int, Int}[] # indices of deprecated keys
     )
 end
 
@@ -264,6 +271,19 @@ Attributes can be marked with a type by annotating their name. This is controls
 the conversions in **Blocks** but is irrelevant to plots.
 
     color::RGBAf = :red
+
+Attributes can be marked as deprecated using
+
+    @deprecate old new
+
+where `old` is the deprecated name and `new` is the replacement. The names can also
+be tuples denoting a path to a nested attributes, e.g. `(outer, inner)`. When
+creating a plot or Block, both `old` and `new` will be added as inputs and merge
+into the `new` node. If `old` is changed, a deprecation warning is shown. This
+warning can be set by adding a string before the `@deprecate` entry (like docstrings).
+The default value of the deprecated attribute can be defined with a normal entry
+`old = ...` before the `@deprecate old new` entry. If omitted, the attribute
+will default to the same value as its replacement.
 
 ## Macro Examples
 
@@ -432,6 +452,18 @@ function build_documented_attributes!(output::Vector, expr::Expr, local_vars)
             end
             push!(output, mixin_expr)
 
+        elseif MacroTools.@capture(attr, @deprecate old_ new_)
+            dep = quote
+                Makie._add_deprecated_attribute!(
+                    attr, state,
+                    $(default_key_expr(old)),
+                    $(default_key_expr(new)),
+                    $(default_expr_string(attr)),
+                    $docs
+                )
+            end
+            push!(output, dep)
+
         else
             error("Could not parse line:\n $line")
         end
@@ -585,6 +617,46 @@ function _merge_attributes_rec!(target, state, source, _trace, current_layer)
             end
         end
     end
+    return
+end
+
+function _add_deprecated_attribute!(attr, state, old::Tuple, new::Tuple, default_expr, docs)
+    layers, keys = state
+    current_layer = last(layers)
+
+    oldstr = join([keys..., old...], '.')
+    newstr = join([keys..., new...], '.')
+
+    if has_nested_key(attr, current_layer, new)
+        new_idx = nested_key_to_index(attr, new, current_layer)
+
+        # Allow `old = ...` to exist so different defaults can be set
+        docstring = something(docs, "$old has been deprecated in favor of $new.")
+        if has_nested_key(attr, current_layer, old)
+            old_idx = nested_key_to_index(attr, old, current_layer)
+            attr.leaf_docstring[old_idx] = docstring
+        else
+            default_value = attr.defaults[new_idx]
+            type = attr.types[attr.type_index[new_idx]]
+
+            for key in Base.front(old)
+                _begin_nesting_layer!(attr, state, key)
+            end
+            _add_attribute!(
+                attr, state, last(old),
+                type, default_value, default_expr, docstring
+            )
+            for _ in Base.front(old)
+                _end_nesting_layer!(state)
+            end
+            old_idx = nested_key_to_index(attr, old, current_layer)
+        end
+
+        push!(attr.deprecation_indices, old_idx => new_idx)
+    else
+        error("Could not add deprecation `@deprecated $oldstr $newstr` because the replacement attribute does not exist. Make sure you add it before calling `@deprecate`.")
+    end
+
     return
 end
 
@@ -755,9 +827,13 @@ function show_documented_attributes(io, attr, layer = 1, tab = 1)
         else
             idx = -idx
             _print_attribute_docstring(io, attr.leaf_docstring[idx], tabstr)
-            T = attr.types[attr.type_index[idx]]
-            Tstr = T === Any ? "" : "::$T"
-            println(io, tabstr, "$key$Tstr = $(attr.default_expr[idx])")
+            if any(p -> p[1] == idx, attr.deprecation_indices)
+                println(io, tabstr, attr.default_expr[idx])
+            else
+                T = attr.types[attr.type_index[idx]]
+                Tstr = T === Any ? "" : "::$T"
+                println(io, tabstr, "$key$Tstr = $(attr.default_expr[idx])")
+            end
         end
     end
     return
@@ -772,9 +848,12 @@ function is_attribute(T::Type, name::Symbol)
     return has_flat_key(attr, name) || has_nested_key(attr, name)
 end
 
-has_nested_key(attr::DocumentedAttributes, keys::Tuple) = has_nested_key(attr, keys...)
-function has_nested_key(attr::DocumentedAttributes, keys::Symbol...)
-    idx = 1
+Base.haskey(attr::DocumentedAttributes, key::Symbol) = has_flat_key(attr, key)
+Base.haskey(attr::DocumentedAttributes, key::Symbol, keys::Symbol...) = has_nested_key(attr, key, keys...)
+
+has_nested_key(attr::DocumentedAttributes, keys::Symbol...) = has_nested_key(attr, keys)
+has_nested_key(attr::DocumentedAttributes, keys::Tuple) = has_nested_key(attr, 1, keys)
+function has_nested_key(attr::DocumentedAttributes, idx::Int, keys::Tuple)
     for key in keys
         if idx < 0 || !haskey(attr.nesting.keytables[idx], key)
             return false
@@ -845,8 +924,8 @@ Returns the flattened index of a single, potentially nested attribute defined by
 further nesting.
 """
 nested_key_to_index(attr::DocumentedAttributes, keys::Symbol...) = nested_key_to_index(attr, keys)
-function nested_key_to_index(attr::DocumentedAttributes, keys::Tuple)
-    idx = unchecked_nested_key_to_index(attr, keys)
+function nested_key_to_index(attr::DocumentedAttributes, keys::Tuple, layer::Integer = 1)
+    idx = unchecked_nested_key_to_index(attr, keys, layer)
     idx > 0 && error("Nested keys $keys point to another nesting layer instead of a value.")
     return -idx
 end
@@ -1423,23 +1502,45 @@ function add_remaining_inputs!(get_callback, graph, attr, exclude = tuple())
 end
 
 """
-    add_theme!(graph::ComputeGraph, attr::DocumentedAttributes, T, scene, exclude, kwargs, cycle)
+    add_theme!(plot, attr::DocumentedAttributes, scene, exclude, kwargs, cycle)
 
 Resolves the theme (`theme(scene)[:Plot]` overwrites, inheriting from
 `theme(scene)` and fallbacks) for each attribute defined in `attributes` that
 is an `Input` not defined by `kwargs`. After this attributes are fully initialized.
 """
-function add_theme!(graph, attr, T, scene, exclude, kwargs, cycle)
+function add_theme!(plot::Plot{Func}, attr, scene, exclude, kwargs, cycle) where {Func}
+    graph = plot.attributes
+    T = Plot{Func}
+
     # add merged keys from kwargs to exclusion list
     collect_merged_keys!(exclude, attr, kwargs)
     # fill out an array with resolved defaults from theme + plot
     defaults = resolve_defaults(
         attr, scene, plotsym(T), NamedTuple(), exclude, false, cycle
     )
+
     # update anything that's an input and not excluded
     for (i, key) in enumerate(attr.merged_keys)
         if !(key in exclude) && haskey(graph.inputs, key)
-            val = to_value(defaults[i])
+            maybe_obs = defaults[i]
+            if maybe_obs isa Observable
+                on(x -> update!(graph, key => x), plot, maybe_obs)
+                # We can get an Observable from kwargs, theme overwrite or theme
+                # inheritance. The latter may add an in-between `map(inherit.callback, obs)`
+                # We need to track the related ObserverFunction for cleanup. To find
+                # it we check that the attribute could be inherited and looks like it
+                # came from inherit_default. (This is hopefully good enough)
+                if attr.defaults[i] isa Inherit
+                    cb = attr.defaults[i].callback
+                    if cb !== identity && length(maybe_obs.inputs) == 1 && maybe_obs.inputs[1].f.f === cb
+                        push!(plot.deregister_callbacks, only(maybe_obs.inputs))
+                    end
+                end
+                val = to_value(maybe_obs)
+            else
+                val = maybe_obs
+            end
+
             # Skipping setproperty/setindex from ComputePipeline to
             # avoid type inference for val.
             setfield!(graph.inputs[key], :value, val)
@@ -1513,7 +1614,7 @@ function resolve_overwrites!(flattened, attr, kwargs, skip, remove = false, leve
         ComputePipeline.has_key_in_level(attr.nesting, level, key) || continue
         idx = attr.nesting.keytables[level][key]
         if idx > 0
-            resolve_overwrites!(flattened, attr, val, skip, idx)
+            resolve_overwrites!(flattened, attr, val, skip, false, idx)
         elseif !isassigned(flattened, -idx) && !in(attr.merged_keys[-idx], skip)
             flattened[-idx] = val
         end
@@ -1564,13 +1665,109 @@ function inherit_default(inherit::Inherit, scene_theme)
     if result isa Inherit # nested inherit
         return inherit_default(result, scene_theme)
     end
-    return inherit.callback(to_value(result))
+    if result isa Observable
+        # keep this in line with add_theme!()'s checks
+        return inherit.callback === identity ? result : map(inherit.callback, result)
+    else
+        return inherit.callback(result)
+    end
 end
 
 function inherit_default(theme, fallback, key::Symbol, keys::Symbol...)
     return haskey(theme, key) ? inherit_default(theme[key], fallback, keys...) : fallback
 end
 inherit_default(theme, fallback, key::Symbol) = get(theme, key, fallback)
+
+# collect every old and new attribute involved in deprecations that has been set by kwargs
+function collect_changed_deprecated_attributes(attr, kwargs, level = 1, buffer = Int[])
+    for (key, val) in pairs(kwargs)
+        ComputePipeline.has_key_in_level(attr.nesting, level, key) || continue
+        idx = attr.nesting.keytables[level][key]
+        if idx > 0
+            collect_changed_deprecated_attributes(attr, val, idx, buffer)
+        elseif any(p -> p[1] == -idx || p[2] == -idx, attr.deprecation_indices)
+            push!(buffer, -idx)
+        end
+    end
+    return buffer
+end
+
+function process_attribute_deprecations!(graph, attr::DocumentedAttributes, kwargs)
+    if !isempty(attr.deprecation_indices)
+        set_by_user = collect_changed_deprecated_attributes(attr, kwargs)
+        process_attribute_deprecations!(graph, attr, set_by_user)
+    end
+    return
+end
+
+struct DeprecatedAttributeCallback <: Function
+    depmsg::String
+end
+function (cb::DeprecatedAttributeCallback)((old, new), changed, @nospecialize(cached))
+    if changed[2]
+        return (new,)
+    else
+        @warn cb.depmsg
+        return (old,)
+    end
+end
+
+function process_attribute_deprecations!(graph, attr::DocumentedAttributes, set_by_user::Vector{Int})
+    for (old_idx, new_idx) in attr.deprecation_indices
+        old_key = attr.merged_keys[old_idx]
+        new_key = attr.merged_keys[new_idx]
+        depmsg = attr.leaf_docstring[old_idx]
+
+        intermediate_name = Symbol(:_, new_key)
+        intermediate_node = ComputePipeline.add_node!(graph, intermediate_name)
+
+        # If we init (old = ...) and resolve, the new input will use its default
+        # value. This may fix its type to something incompatible with old / the
+        # merged node and cause an error when changed later (incompatible type).
+        # To avoid, set Any here.
+        edge = graph[new_key].parent
+        if edge isa ComputePipeline.Input
+            ComputePipeline.modify_edge!(edge, output = intermediate_node)
+            ComputePipeline.set_type!(intermediate_node, Any, true)
+        else
+            ComputePipeline.modify_edge!(edge, outputs = [intermediate_node])
+            # If parent is a ComputeEdge, the type may already get fixed beforehand
+            # in the parent graph. Let ComputePipeline use that type.
+            if edge.callback === ComputePipeline.compute_identity
+                # will use the same (===) ref, no need to change anything
+            else # e.g. conversion function
+                T = attr.types[attr.type_index[new_idx]]
+                ComputePipeline.set_type!(intermediate_node, T, true)
+            end
+        end
+
+        # Same thing for the old node after new resolve
+        if graph[old_key].parent isa ComputePipeline.Input
+            ComputePipeline.set_type!(graph[old_key], Any, true)
+        end
+
+        register_computation!(
+            DeprecatedAttributeCallback(depmsg), graph, [old_key, intermediate_name], [new_key]
+        )
+
+        # On init both old and new would be considered changed
+        init = intermediate_node[]
+        oldval = graph[old_key][]
+        # trigger depwarn if user set deprecated attribute
+        if old_idx in set_by_user
+            @warn depmsg
+            # only prioritize deprecated attribute if replacement has not been set
+            if !in(new_idx, set_by_user)
+                init = oldval
+            end
+        end
+
+        # TODO: What is initializing this early?
+        T = eltype(intermediate_node.value) # Union of both? typejoin? always Any?
+        ComputePipeline.unsafe_init!(graph[new_key], Ref{T}(init), true)
+    end
+    return
+end
 
 ########################################
 # Block Infrastructure (merged init)
