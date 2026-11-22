@@ -121,12 +121,7 @@ function initialize_block!(leg::Legend; entrygroups)
         enlarge(la, -lm[1], -lm[2], -lm[3], -lm[4])
     end
 
-    backgroundcolor = if !isnothing(leg.bgcolor[])
-        @warn("Keyword argument `bgcolor` is deprecated, use `backgroundcolor` instead.")
-        leg.bgcolor
-    else
-        leg.backgroundcolor
-    end
+    backgroundcolor = leg.backgroundcolor
 
     bg = poly!(
         scene,
@@ -354,7 +349,7 @@ function initialize_block!(leg::Legend; entrygroups)
                 # fill missing entry attributes with those carried by the legend
                 mergeleft!(entry.attributes, preset_attrs)
 
-                isnothing(entry.label[]) && continue
+                isnothing(to_value(entry.label)) && continue
 
                 # create the label
                 justification = map(leg.labeljustification, entry.labelhalign) do lj, lha
@@ -1081,7 +1076,7 @@ function get_labeled_plots(ax; merge::Bool, unique::Bool)
     end
 
     labels_init = map(lplots_init) do l
-        l.label[]
+        to_value(l.label)
     end
 
     lplots_flat, labels_flat = if any(x -> x isa AbstractVector, labels_init)
